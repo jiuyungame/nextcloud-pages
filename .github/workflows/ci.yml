@@ -1,0 +1,148 @@
+# Continuous integration: everything that can run without a Nextcloud instance.
+#
+# The acceptance suites under tests/*.sh need a live instance with its own credentials, so they stay a
+# local step (README, "Development"). Anything that only needs the sources runs here.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  php:
+    name: PHP syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+      - name: Lint every PHP file
+        run: |
+          set -euo pipefail
+          find lib appinfo templates -name '*.php' -print0 | xargs -0 -n1 php -l
+
+  frontend:
+    name: Frontend build and proof
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.20.0'
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: The committed bundles are the build of src
+        run: git diff --exit-code -- js css
+      - name: Template placement and render proof
+        run: node tests/proof-frontend.mjs
+
+  bridge:
+    name: Bridge smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run the bridge smoke suite
+        run: python3 bridge/tests/test_smoke.py
+
+  l10n:
+    name: Translations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.20.0'
+      - name: Every t() key exists in l10n/zh_CN.json
+        run: |
+          set -euo pipefail
+          script="$RUNNER_TEMP/l10n-audit.mjs"
+          cat > "$script" <<'JS'
+          // Every source string the app passes to a translator must exist in l10n/zh_CN.json. The app is
+          // written in English and zh_CN.json is its catalogue: a string that reaches t() but not the
+          // catalogue cannot be translated at all, and nothing fails — the UI just stays English.
+          //
+          //   PHP   $l->t('…') / $this->l10n->t('…')      (lib/, templates/, appinfo/)
+          //   JS    t('pages', '…')                       (src/)
+          //
+          // Not checked on purpose: keys built at runtime (not literals) and plurals (n()), whose
+          // catalogue entries are arrays.
+          import { readdirSync, readFileSync, statSync } from 'node:fs'
+          import { extname, join } from 'node:path'
+
+          const SOURCE_DIRS = ['lib', 'templates', 'src', 'appinfo']
+          const EXTENSIONS = new Set(['.php', '.js', '.mjs', '.vue'])
+          const CATALOGUE = 'l10n/zh_CN.json'
+
+          // A ratchet, not an allow-list: a key listed here that becomes translated also fails, so the
+          // list can only shrink. These five are long server hints plus one app name; add them to the
+          // catalogue and delete them here.
+          const KNOWN_GAPS = new Set([
+            'The build command, the output folder and the site-level exclusions duplicate the bridge\'s own configuration ([site.recipe] and exclude/unexclude in its TOML, `occ pages:config` for the global list), so they are not edited here: the stored values are kept and "Save site" does not reset them.',
+            'The site has no readable %1$s, so the author mirror falls back to its default directory %2$s. If the site is not the Jekyll authors template at all, ignore this; otherwise the app\'s author content directory (%3$s) has to be the same name.',
+            'The site reads its author folders from %1$s, the app writes them to %2$s: the mirror is invisible to the site, so no author page is ever built. Set authors.source to %2$s in the site\'s %3$s (or change the author content directory to %1$s), then rebuild.',
+            'The visibility manifest %s is not there yet; it is written by the first visibility action (a request, a decision or a publish). It lives in the app\'s own private storage, not in anybody\'s files and not editable through the Files app, and until it exists every article counts as internal and nothing is on the site.',
+            'pages-admin',
+          ])
+
+          function files(dir, out = []) {
+            for (const name of readdirSync(dir)) {
+              const path = join(dir, name)
+              if (statSync(path).isDirectory()) {
+                files(path, out)
+              } else if (EXTENSIONS.has(extname(name))) {
+                out.push(path)
+              }
+            }
+            return out
+          }
+
+          const pattern = /(?:\bt\(|->t\()\s*'pages'\s*,\s*'((?:[^'\\]|\\.)*)'|->t\(\s*'((?:[^'\\]|\\.)*)'/g
+          const used = new Set()
+          let scanned = 0
+          for (const dir of SOURCE_DIRS) {
+            for (const path of files(dir)) {
+              const text = readFileSync(path, 'utf8')
+              scanned += 1
+              for (const match of text.matchAll(pattern)) {
+                used.add((match[1] || match[2] || '').replaceAll("\\'", "'"))
+              }
+            }
+          }
+
+          const catalogue = JSON.parse(readFileSync(CATALOGUE, 'utf8'))
+          const translations = catalogue.translations.zh_CN || catalogue.translations
+          const missing = [...used].filter((key) => key !== '' && !(key in translations))
+          const unexpected = missing.filter((key) => !KNOWN_GAPS.has(key))
+          const translatedGaps = [...KNOWN_GAPS].filter((key) => key in translations)
+
+          console.log(`l10n audit: ${used.size} literal key(s) in ${scanned} source file(s), ${Object.keys(translations).length} key(s) in ${CATALOGUE}`)
+
+          if (unexpected.length > 0) {
+            console.error('\nThese strings reach a translator but are not in the catalogue:')
+            for (const key of unexpected) {
+              console.error(`  - ${JSON.stringify(key)}`)
+            }
+            console.error('\nAdd them to l10n/zh_CN.json (with a Chinese translation).')
+            process.exit(1)
+          }
+
+          if (translatedGaps.length > 0) {
+            console.error('\nThese keys are translated now — delete them from KNOWN_GAPS in .github/workflows/ci.yml:')
+            for (const key of translatedGaps) {
+              console.error(`  - ${JSON.stringify(key)}`)
+            }
+            process.exit(1)
+          }
+
+          console.log(`ok: every key is either translated or one of the ${KNOWN_GAPS.size} known gaps`)
+          JS
+          node "$script"

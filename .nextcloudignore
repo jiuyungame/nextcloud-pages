@@ -1,0 +1,46 @@
+# .nextcloudignore — what a Nextcloud App Store builder (krankerl and friends) leaves out of the
+# package. Gitignore-style patterns, one rooted path per line, applied while packaging; it is not
+# read at runtime and it does not affect what the app can do.
+#
+# `tools/package.sh` produces the same package from an explicit whitelist
+# (appinfo/ img/ js/ css/ l10n/ lib/ templates/ LICENSE README.md CHANGELOG.md), so the two lists
+# have to agree: the whitelist is what ships, this file is what every other builder must skip.
+
+# Repository furniture
+/.git
+/.github
+/.gitignore
+/.nextcloudignore
+/build
+/dist
+/.deploy-assets.sha
+
+# Development-only trees: sources, tests, the host daemon, docs scripts, screenshots
+/src
+/tests
+/tools
+/bridge
+/scripts
+/screenshots
+
+# Node tooling: the bundles are committed, so a package never builds anything
+/node_modules
+/package.json
+/package-lock.json
+/vite.config.js
+
+# Test scaffolding (none is committed today; listed so it cannot slip in later)
+/phpunit.xml
+
+# Editors, caches, archives
+/.vscode
+/.idea
+__pycache__
+*.py[cod]
+*.tgz
+
+# Markdown: the only root-level files are README.md and CHANGELOG.md, and both belong in the
+# package (the README is what a user opens first, the CHANGELOG is the release history). No
+# `*.md` glob is used here on purpose: every other .md in the repository lives inside a directory
+# excluded above, and gitignore-style negation (`!README.md`) is not implemented by every builder —
+# one that ignored the negation would silently ship a package without its README.

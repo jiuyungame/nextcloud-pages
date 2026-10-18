@@ -1,0 +1,24 @@
+/**
+ * Global styles, bundled into css/pages-main.css.
+ */
+
+/*
+ * The mount point must be transparent to the layout: without its own box,
+ * #content-vue becomes a direct flex child of #content instead of being
+ * wrapped in an extra div that breaks the flex chain.
+ */
+#pages-app {
+	display: contents;
+}
+
+.pages-loading {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 24px;
+	opacity: 0.7;
+}
+
+.pages-noscript {
+	padding: 24px;
+}

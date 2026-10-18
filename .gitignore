@@ -1,0 +1,39 @@
+# The built frontend (js/, css/) is **committed on purpose**: the App Store package ships
+# the compiled bundles and users never run node or npm. CI verifies that what is committed
+# still matches what `npm run build` produces from src/ (see .github/workflows/ci.yml);
+# after changing anything in src/, run `npm run build` and commit the result with it.
+
+# Dependencies (installed with `npm ci`, never committed)
+node_modules/
+
+# Python byte code and virtualenvs — the bridge is standard library only, so byte code
+# caches are the only thing it produces (they embed the local absolute path of this
+# checkout, so they must never reach the repository or a package)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# The smoke tests' scratch directory
+bridge/.test-tmp/
+
+# Packaging and deployment output (tools/package.sh, scripts/release/package-app.sh)
+build/
+dist/
+*.tgz
+
+# Local scratch files
+.tmp*
+.deploy-assets.sha
+
+# Local bridge configuration: the real one carries the two secrets, and an effective.json
+# pushed by the app does too. The repository contains bridge/pages-bridge.toml.example only.
+pages-bridge.toml
+*.local.toml
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

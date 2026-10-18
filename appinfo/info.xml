@@ -1,0 +1,84 @@
+<?xml version="1.0"?>
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+  <id>pages</id>
+  <name>Pages</name>
+  <summary>Edit, build and publish static websites from Nextcloud</summary>
+  <description><![CDATA[
+# Pages
+
+Pages turns Nextcloud into the editing surface for a static website — Jekyll, Hugo,
+Eleventy, Astro, VitePress, or plain HTML — and takes it all the way to publication.
+
+## What the app does
+
+- Browses and edits the site source **with Nextcloud's own file API**, so version
+  history, trash, sharing, desktop sync and activity all keep working
+- Rebuilds the site as you type and shows a live preview in the same page
+- Reviews the diff and publishes with a single click (or opens a pull request)
+- Shows the deployment status of the remote CI run
+
+## Deployment model
+
+**This app is the control plane; a companion service is the data plane.**
+
+Nextcloud PHP cannot execute host binaries, and it must not be given the power to
+start host processes. So the work that needs a real shell — mirroring the source
+into a working copy, running the site generator, and driving git — is done by
+`pages-bridge`, a small zero-dependency Python service that runs on the same host.
+
+The administrator installs that service once (the app hands you a ready-to-paste
+command with the secrets and paths already filled in), and from then on this app
+owns the configuration: sites are defined here and pushed to the bridge.
+
+Nothing is installed or started behind your back: enabling this app never touches
+files outside its own data directory.
+
+## Current scope
+
+Targets self-hosted deployments where the administrator can run a small service on
+the Nextcloud host. Instances that forbid `exec` and cannot run such a service fall
+back to a read/write editor without build or publish.
+]]></description>
+  <version>0.1.0</version>
+  <licence>agpl</licence>
+  <author homepage="https://github.com/hwshqtb">hwshqtb</author>
+  <namespace>Pages</namespace>
+  <category>tools</category>
+  <category>files</category>
+  <website>https://github.com/jiuyungame/nextcloud-pages</website>
+  <discussion>https://github.com/jiuyungame/nextcloud-pages/discussions</discussion>
+  <bugs>https://github.com/jiuyungame/nextcloud-pages/issues</bugs>
+  <repository>https://github.com/jiuyungame/nextcloud-pages</repository>
+  <!--
+    Screenshots are URLs on purpose: the App Store schema types <screenshot> as a secure URL
+    (info.xsd, "secure-url"), so a relative path such as screenshots/1-my-articles.png would
+    fail validation. They point at the repository, which is also why the PNGs are not part of
+    the app package (.nextcloudignore excludes screenshots/). Keep the owner/repository part of
+    these URLs in step with <repository> above.
+  -->
+  <screenshot>https://raw.githubusercontent.com/jiuyungame/nextcloud-pages/main/screenshots/1-my-articles.png</screenshot>
+  <screenshot>https://raw.githubusercontent.com/jiuyungame/nextcloud-pages/main/screenshots/2-editor.png</screenshot>
+  <screenshot>https://raw.githubusercontent.com/jiuyungame/nextcloud-pages/main/screenshots/3-requests.png</screenshot>
+  <screenshot>https://raw.githubusercontent.com/jiuyungame/nextcloud-pages/main/screenshots/4-settings.png</screenshot>
+  <dependencies>
+    <php min-version="8.1"/>
+    <nextcloud min-version="30" max-version="34"/>
+  </dependencies>
+  <settings>
+    <admin>OCA\Pages\Settings\Admin</admin>
+    <admin-section>OCA\Pages\Settings\AdminSection</admin-section>
+  </settings>
+  <!--
+    There is no static navigation declaration here on purpose: the preview is open to every signed-in
+    user, so the menu entry is registered at runtime in Application::boot() instead.
+  -->
+  <commands>
+    <command>OCA\Pages\Command\BridgeConfig</command>
+    <command>OCA\Pages\Command\Doctor</command>
+    <command>OCA\Pages\Command\Manifest</command>
+    <command>OCA\Pages\Command\PushConfig</command>
+    <command>OCA\Pages\Command\Repair</command>
+    <command>OCA\Pages\Command\SelfTest</command>
+  </commands>
+</info>

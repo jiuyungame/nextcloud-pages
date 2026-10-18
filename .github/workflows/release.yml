@@ -1,0 +1,64 @@
+name: Release
+
+# Publishing a release means pushing a tag: v0.3.66 → <version>0.3.66</version>.
+#
+#   git tag v0.3.66 && git push origin v0.3.66
+#
+# The job asserts that agreement first, then builds, packages with the same whitelist the developer
+# uses locally (tools/package.sh), and attaches the tarball to a GitHub release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Package and publish the release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag matches <version> in appinfo/info.xml
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's:.*<version>\([^<]*\)</version>.*:\1:p' appinfo/info.xml | head -1)
+          if [[ -z "$version" ]]; then
+            echo "::error file=appinfo/info.xml::cannot read <version>"
+            exit 1
+          fi
+          tag="${GITHUB_REF_NAME#v}"
+          if [[ "$tag" != "$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match <version>$version</version> in appinfo/info.xml — bump the version and tag again"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "✓ tag $GITHUB_REF_NAME matches appinfo/info.xml $version"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # the version that produced the committed bundles (see .github/workflows/ci.yml)
+          node-version: '24.20.0'
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Build the App Store package
+        run: bash tools/package.sh
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          gh release create "$GITHUB_REF_NAME" "build/pages-$version.tar.gz" \
+            --title "pages $version" \
+            --generate-notes

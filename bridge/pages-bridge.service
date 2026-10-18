@@ -1,0 +1,39 @@
+[Unit]
+Description=pages-bridge — host-side executor for the Nextcloud Pages app (mirror + build + git)
+Documentation=https://github.com/hwshqtb/pages
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m pages_bridge -c /etc/pages-bridge/pages-bridge.toml serve
+WorkingDirectory=/opt/pages-bridge
+Restart=always
+RestartSec=3
+
+# the service needs read access to the Nextcloud data dir and write access to the work root
+User=root
+Group=root
+
+Environment=HOME=/root
+Environment=PAGES_BRIDGE_LOG=info
+Environment=PYTHONUNBUFFERED=1
+
+NoNewPrivileges=true
+
+# PrivateTmp must stay off: the work copy lives in /tmp/pages and has to outlive restarts
+PrivateTmp=false
+
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# ProtectHome stays off on purpose: work_root may sit under /root
+# ProtectSystem=strict stays off on purpose: the reverse flow writes into the Nextcloud data dir
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pages-bridge
+
+[Install]
+WantedBy=multi-user.target

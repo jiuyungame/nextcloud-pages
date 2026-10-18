@@ -1,0 +1,36 @@
+{
+  "name": "pages",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Nextcloud Pages — edit, build and publish static sites from Nextcloud",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "build": "vite build && vite build --mode admin",
+    "build:app": "vite build",
+    "build:admin": "vite build --mode admin",
+    "watch": "vite build --mode development --watch"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.8.1",
+    "@codemirror/lang-css": "^6.3.1",
+    "@codemirror/lang-html": "^6.4.11",
+    "@codemirror/lang-javascript": "^6.2.4",
+    "@codemirror/lang-markdown": "^6.5.0",
+    "@codemirror/lang-yaml": "^6.1.2",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.38.6",
+    "@nextcloud/auth": "^2.6.0",
+    "@nextcloud/axios": "^2.6.0",
+    "@nextcloud/l10n": "^3.4.1",
+    "@nextcloud/router": "^3.1.0",
+    "@nextcloud/vue": "^9.13.1",
+    "codemirror": "^6.0.2",
+    "vue": "^3.5.18",
+    "vue-material-design-icons": "^5.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.1",
+    "vite": "^7.3.6"
+  }
+}

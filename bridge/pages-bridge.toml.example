@@ -1,0 +1,214 @@
+# pages-bridge configuration example
+#
+# Copy to /etc/pages-bridge/pages-bridge.toml and edit.
+#
+# There are two ways to run this bridge:
+#
+#   1. Hosted (default, nothing to copy by hand): leave the secrets and the [site] table out.
+#      The bridge starts UNPAIRED, listens on loopback only and answers nothing but GET /health
+#      and POST /pair. `install.sh` prints a one-time pairing code; enter it in the Nextcloud
+#      Pages settings and the app generates both secrets, discovers the data directory and pushes
+#      the whole configuration. From then on the app owns every parameter below.
+#      This needs Nextcloud and the bridge on the same machine (see bridge/README.md).
+#
+#   2. Hand-written (unchanged from before, and the only option across hosts): set both secrets
+#      and the [site] table here. The bridge is then paired from the start, the app is configured
+#      with the same shared_secret, and nothing else changes.
+#
+# Every path must be absolute. The source directory, the work copy (the commit tree) and the
+# preview directory (the tree the build runs in) are validated not to contain each other.
+
+listen = "127.0.0.1:8787"
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# shared_secret          : Nextcloud app ↔ bridge credential, never leaves the machine
+# session_signing_secret : signs the short-lived preview tokens handed to browsers
+#
+# Leave both out to pair from the Nextcloud app; set them (at least 16 characters each, generate
+# with `python3 -m pages_bridge gen-secret`) to run the hand-written path. Once the app has paired,
+# the values it pushed live in <state_dir>/effective.json and these are no longer used.
+#
+# shared_secret          = "REPLACE_ME"
+# session_signing_secret = "REPLACE_ME"
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+# Nextcloud data directory. Same path inside and outside the snap, so the host
+# process can read and write it directly. The app pushes the value it discovers during pairing.
+nc_data_root = "/var/snap/nextcloud/common/nextcloud/data"
+
+# Root of the site's directories. Single site: the **commit tree** (the git working tree a
+# publish commits from) is this directory itself unless the [site] table below sets an explicit
+# work_path — there is no <work_root>/<site> level. The **preview tree** is a sibling of it:
+# <work_root>.preview by default (see preview_dir under [site]).
+#
+# Defaults to **/tmp** on purpose: both trees are disposable build/commit caches, the
+# Nextcloud source is the only source of truth. The system clearing /tmp (or a WSL
+# restart) is expected — the bridge re-clones (see do_mirror / do_init in server.py),
+# so do not treat it as a data directory.
+work_root    = "/tmp/pages"
+
+# State / override files / logs owned by the bridge. All outside the work tree.
+# effective.json (the configuration the app pushed, secrets included, mode 0600) and the
+# one-time pairing.json live in state_dir.
+state_dir    = "/var/lib/pages/state"
+override_dir = "/var/lib/pages/overrides"
+log_dir      = "/var/lib/pages/logs"
+
+# ── Build ────────────────────────────────────────────────────────────────────
+build_timeout_s   = 180     # build timeout in seconds; on timeout the whole process group is killed
+build_debounce_ms = 700     # how long to wait after a touch before actually building
+log_tail_lines    = 200
+
+# ── Mirror ───────────────────────────────────────────────────────────────────
+mirror_verify = "size+mtime"      # or "sha256" (more accurate, slower)
+mirror_delete_guard_ratio = 0.2   # abort when a single run would delete more than 20% of the target
+mirror_delete_guard_min   = 20    # but always allow deleting up to 20 entries
+
+# Whether to keep the source file mode when copying to the target.
+# Defaults to false (everything 644): site sources often come from drvfs/NTFS where
+# every file is 777, so "preserve the executable bit" would mark the whole tree
+# executable. Turn it on for repositories that really need +x.
+mirror_preserve_exec = false
+
+# ── Exclusions ───────────────────────────────────────────────────────────────
+# "What is not source" is answered by the **repository's own .gitignore** by default:
+# the bridge asks git directly
+# (git ls-files --others --ignored --exclude-standard --directory).
+# Benefit: the repository itself decides what its source is, so nothing here has to follow
+# the Jekyll layout; whatever the repository calls source is source, and new files that are
+# neither committed nor ignored count as source too.
+mirror_use_gitignore = true
+
+# Fallback list, used only when the option above is off or no gitignore is available
+# (the work copy is not a git repository yet):
+#   _site .jekyll-cache .sass-cache .jekyll-metadata vendor node_modules
+#   .bundle public dist Gemfile.lock
+# Under normal conditions it does **not** apply.
+
+# Exclude a few more entries on top of .gitignore (editor/project clutter)
+exclude = [".vscode", ".idea", ".DS_Store"]
+
+# Escape hatch: remove a name from the exclusion set. .git cannot be removed
+# (the mirror must never touch the repository).
+unexclude = []
+
+# ── The site (optional: the app pushes it) ───────────────────────────────────
+#
+# The bridge serves exactly one site, so this is a single [site] table. It is only a
+# **bootstrapping seed** for the hand-written path: once the app pushes its own site
+# configuration, the app wins. Leave the whole table out when you pair from the app -
+# the site arrives with the pairing request.
+#
+# [site]
+# Source: <nc_data_root>/<nc_user>/files/<nc_path>
+# nc_user is the user-name layer under the Nextcloud data directory (not visible in
+# the web UI; look under data/ or run `occ user:list`). **Required**, with no
+# fallback default — guessing wrong points at a directory that does not exist.
+# nc_user      = "alice"
+# nc_path      = "/Sites/my-site"
+#
+# Site directory that receives every author's whole tree: author A's files are mirrored to
+# "<author_root>/<A>/…". One path segment, starting with a letter or a digit (no "/", no "..",
+# no leading "." or "_", because the site's own Jekyll directories start that way). Defaults to
+# "tmp" when absent, so an app that predates this field keeps publishing, and the two legacy
+# areas ("_posts/<uid>/…" and "assets/authors/…") stay accepted either way.
+# author_root  = "tmp"
+#
+# Commit tree (an ordinary git working tree). It holds the site's own files plus the author
+# files that are **on the site** (the `on_site` list the app pushes); it is never built, so it
+# has no build output. Defaults to work_root itself (/tmp/pages). A hard-coded value works too,
+# but it must not sit inside the source directory or contain it (the config validation rejects
+# that), and it must not be the preview directory.
+# work_path    = "/tmp/pages"
+#
+# Preview tree: the second directory. It holds every author file (internal and external alike)
+# plus the site's own files, and the **build runs here**; the preview route serves its
+# output_dir. It must be an absolute path outside the work copy (validated: neither may contain
+# the other). Defaults to a sibling of the work copy: <work_path or work_root>.preview.
+# The app pushes this field like the other site fields (derived from the work root it pushes).
+# preview_dir  = "/tmp/pages.preview"
+#
+# repo_url     = "git@github.com:your-name/your-site.git"
+# remote_name  = "origin"
+# branch       = "main"
+#
+# [site.recipe]
+# Jekyll is the only generator: every site is built with it. `preset` may be left out (that
+# already means jekyll) or say "jekyll"; a config pushed by an older app version may still
+# carry "auto", the old probing mode, which is accepted as jekyll too. Any other value is
+# refused - a different generator is not a preset here, it is the `command` below.
+#
+# preset     = "jekyll"
+# output_dir = "_site"
+#
+# Build command, dependency install and their environment. Both commands default to the
+# jekyll values (["bundle", "exec", "jekyll", "build"] and ["bundle", "install"]); an empty
+# list skips the step, so `command = []` builds nothing and publishes the source itself.
+# command     = ["bundle", "exec", "jekyll", "build", "--trace"]
+# install_cmd = ["bundle", "install"]
+# env         = { JEKYLL_ENV = "production" }
+#
+# Build-time variable overrides. The override file is written by the bridge under
+# override_dir, **not** inside the site directory, so `git add -A` never commits it
+# and the mirror never sees it as an extra entry. Jekyll receives it as the second
+# entry of the `--config` chain, after the preset's own `base_config` (_config.yml):
+# overrides  = { url = "https://your-name.github.io" }
+
+# ── Author sources (optional: the app pushes them) ───────────────────────────
+#
+# One site, several Nextcloud folders: every author keeps writing in **their own** files and
+# the bridge mirrors the files they name into the site's two directories. The app normally
+# pushes this list inside its own `site` object; the TOML form below is the hand-written
+# equivalent (and a working seed for `install.sh`).
+#
+# Rules, all of them deliberate:
+#
+#   * `uid` is the Nextcloud user; `path` is inside **that user's** files, so the source of an
+#     entry is <nc_data_root>/<uid>/files/<path>/<entry.path>. It must start with "/" and must
+#     not overlap the site's own source (or either directory).
+#   * `entries[].target` is a path in the site and may only be
+#     "<author_root>/<uid>/…" (that author's whole tree: any depth, any file type - images are
+#     mirrored too), or the legacy "_posts/<uid>/…" (that author's posts) and
+#     "assets/authors/<uid>.css" / "assets/authors/<uid>/<slug>.css" (that author's stylesheet).
+#     Anything else - the site's own files, another author's area - is refused when the config is
+#     loaded. `author_root` is the [site] field above; the validation and the skeleton mirror's
+#     exclusion list are derived from that one value, so they cannot disagree.
+#   * `entries` is mirrored into the **preview tree**: everything the author's area holds, so an
+#     internal page is built and previewable. `on_site` (the same entry shape) is the subset that
+#     is approved for the site and is mirrored into the **commit tree**; absent means "the same as
+#     entries", which is the single-tree behaviour of an older app.
+#   * `removed` holds **targets** (already site-relative), never source paths: the bridge never
+#     maps a source file to a target on its own. Only what is named there is ever deleted from
+#     either tree, and even that goes through mirror_delete_guard_*.
+#   * A file that disappeared from an author's folder is reported as `missing` and is **not**
+#     deleted; if the author's folder itself is gone, that round deletes nothing at all.
+#   * A page that is turned internal (still in the area, no longer approved) leaves the commit
+#     tree at the next mirror and stays in the preview tree; it is not reported `removed`.
+#
+# [[site.authors]]
+# uid   = "bob"                  # <nc_data_root>/bob/files/Pages/posts/...
+# path  = "/Pages/posts"
+# removed = [                    # targets the app has decided are gone; empty on a first run
+#   "_posts/bob/2026-04-01-old.md",
+#   "assets/authors/bob/2026-04-01-old.css",
+# ]
+#
+# [[site.authors.entries]]
+# path   = "2026-05-01-hello.md"                       # in bob's folder
+# target = "_posts/bob/2026-05-01-hello.md"            # the legacy post shape
+#
+# [[site.authors.entries]]
+# path   = "images/pic.png"
+# target = "tmp/bob/images/pic.png"                    # the author's tree under author_root
+#
+# [[site.authors.entries]]
+# path   = "theme.css"
+# target = "assets/authors/bob.css"                    # the per-author stylesheet
+#
+# [[site.authors.entries]]
+# path   = "2026-05-01-hello.css"
+# target = "assets/authors/bob/2026-05-01-hello.css"   # one post's sibling stylesheet
+#
+# [[site.authors.on_site]]                              # the approved subset (commit tree)
+# path   = "2026-05-01-hello.md"
+# target = "_posts/bob/2026-05-01-hello.md"

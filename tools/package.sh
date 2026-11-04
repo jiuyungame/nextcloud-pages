@@ -74,18 +74,31 @@ done
 echo "  ✓ info.xml shape OK (id/namespace/licence/version)"
 
 # release gate: no hardcoded user name or private path may ship in the package
-# the scan is generic: the info.xml author name, plus a few private path shapes
+# the scan is generic: the info.xml author name in code, retired personal accounts in every text
+# file, plus a few private path shapes. bridge/ is scanned as a whole -- the .service unit ships
+# to administrators and an account link in it leaks just as well as one in a .php file.
 AUTHOR=$(sed -n 's:.*<author[^>]*>\([^<]*\)</author>.*:\1:p' appinfo/info.xml | head -1)
-SCAN_DIRS=(lib templates appinfo bridge/pages_bridge)
+# accounts that belong to a person, not to the project: they must never reappear in a shipped file
+RETIRED_ACCOUNTS=(hwshqtb)
+SCAN_DIRS=(lib templates appinfo bridge)
 PERSONAL_FILES=()
 
 if [[ -n "$AUTHOR" ]]; then
-	# the author name in code is a trace (in info.xml / README it is legitimate attribution)
+	# the author name in code is a trace (in info.xml / README / the project's own URLs it is
+	# legitimate attribution, which is why this scan stays on source files, not every text file)
 	while IFS= read -r hit; do
 		[[ -n "$hit" ]] && PERSONAL_FILES+=("author name '$AUTHOR': $hit")
 	done < <(grep -rIl --include='*.php' --include='*.py' --include='*.js' --include='*.vue' \
 		-F "$AUTHOR" "${SCAN_DIRS[@]}" 2>/dev/null || true)
 fi
+
+# retired personal accounts: checked in every text file whatever its extension, so the systemd
+# unit and the .toml.example are covered too. -I skips binaries, so byte-code cannot match.
+for account in "${RETIRED_ACCOUNTS[@]}"; do
+	while IFS= read -r hit; do
+		[[ -n "$hit" ]] && PERSONAL_FILES+=("retired account '$account': $hit")
+	done < <(grep -rIl -F "$account" "${SCAN_DIRS[@]}" 2>/dev/null || true)
+done
 
 # private / local-machine paths
 while IFS= read -r hit; do
@@ -96,7 +109,7 @@ if [[ ${#PERSONAL_FILES[@]} -gt 0 ]]; then
 	die "package contains personal environment traces, clean them before releasing:
 $(printf '    %s\n' "${PERSONAL_FILES[@]}")"
 fi
-echo "  ✓ no personal environment traces (author name '${AUTHOR:-undeclared}' absent from code; no local paths)"
+echo "  ✓ no personal environment traces (author name '${AUTHOR:-undeclared}' absent from code; no retired accounts; no local paths)"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/$APP_ID"

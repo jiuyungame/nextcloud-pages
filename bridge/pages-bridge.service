@@ -1,6 +1,6 @@
 [Unit]
 Description=pages-bridge — host-side executor for the Nextcloud Pages app (mirror + build + git)
-Documentation=https://github.com/hwshqtb/pages
+Documentation=https://github.com/jiuyungame/nextcloud-pages
 After=network-online.target
 Wants=network-online.target
 

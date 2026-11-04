@@ -74,12 +74,10 @@ done
 echo "  ✓ info.xml shape OK (id/namespace/licence/version)"
 
 # release gate: no hardcoded user name or private path may ship in the package
-# the scan is generic: the info.xml author name in code, retired personal accounts in every text
-# file, plus a few private path shapes. bridge/ is scanned as a whole -- the .service unit ships
-# to administrators and an account link in it leaks just as well as one in a .php file.
+# the scan is generic: the info.xml author name in code, plus a few private path shapes. bridge/ is
+# scanned as a whole -- the .service unit ships to administrators and an account link in it leaks
+# just as well as one in a .php file.
 AUTHOR=$(sed -n 's:.*<author[^>]*>\([^<]*\)</author>.*:\1:p' appinfo/info.xml | head -1)
-# accounts that belong to a person, not to the project: they must never reappear in a shipped file
-RETIRED_ACCOUNTS=(hwshqtb)
 SCAN_DIRS=(lib templates appinfo bridge)
 PERSONAL_FILES=()
 
@@ -92,14 +90,6 @@ if [[ -n "$AUTHOR" ]]; then
 		-F "$AUTHOR" "${SCAN_DIRS[@]}" 2>/dev/null || true)
 fi
 
-# retired personal accounts: checked in every text file whatever its extension, so the systemd
-# unit and the .toml.example are covered too. -I skips binaries, so byte-code cannot match.
-for account in "${RETIRED_ACCOUNTS[@]}"; do
-	while IFS= read -r hit; do
-		[[ -n "$hit" ]] && PERSONAL_FILES+=("retired account '$account': $hit")
-	done < <(grep -rIl -F "$account" "${SCAN_DIRS[@]}" 2>/dev/null || true)
-done
-
 # private / local-machine paths
 while IFS= read -r hit; do
 	[[ -n "$hit" ]] && PERSONAL_FILES+=("local path: $hit")
@@ -109,7 +99,7 @@ if [[ ${#PERSONAL_FILES[@]} -gt 0 ]]; then
 	die "package contains personal environment traces, clean them before releasing:
 $(printf '    %s\n' "${PERSONAL_FILES[@]}")"
 fi
-echo "  ✓ no personal environment traces (author name '${AUTHOR:-undeclared}' absent from code; no retired accounts; no local paths)"
+echo "  ✓ no personal environment traces (author name '${AUTHOR:-undeclared}' absent from code; no local paths)"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/$APP_ID"

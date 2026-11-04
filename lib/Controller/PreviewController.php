@@ -72,6 +72,12 @@ class PreviewController extends BaseController
      * Proxies the build output. #[NoCSRFRequired]: a plain iframe GET carries no requesttoken, and
      * the short-lived signed token is the real credential for this route. #[NoAdminRequired]: the
      * preview is open to every signed-in user; the token check below stays the gate.
+     *
+     * `?tree=` selects which build output is read: absent or `preview` is the published site (the
+     * author preview, unchanged), `onlinepreview` is the bridge's review tree - the published content
+     * with the frozen candidates of pending requests laid over it, which is what a reviewer compares
+     * against the live page before deciding. The review tree is *unapproved* content, so it is
+     * restricted to reviewers below; the token is the same read-only `preview` token either way.
      */
     #[NoCSRFRequired]
     #[NoAdminRequired]
@@ -94,6 +100,24 @@ class PreviewController extends BaseController
             return $this->plainError($e->getBridgeCode() === 'SESSION_EXPIRED' ? 401 : 403, $e->getMessage(), $e);
         }
 
+        // `?tree=` selects the build output. Only the exact bridge name selects the review tree; any
+        // other value (a typo, a repeated or array parameter, a client that predates the selector) is
+        // ignored and the published tree is served - the parameter can add one tree, never widen
+        // access, and an iframe that arrived with a misspelled name is better off with the page it
+        // would have got anyway than with an error page. The explicit comparison below is therefore
+        // the *only* way into unapproved content, and the check after it is the one that guards it.
+        $requested = $this->request->getParam('tree', PreviewProxy::TREE_PREVIEW);
+        $tree = is_string($requested) && $requested === PreviewProxy::TREE_ONLINEPREVIEW
+            ? PreviewProxy::TREE_ONLINEPREVIEW
+            : PreviewProxy::TREE_PREVIEW;
+
+        // The review tree holds content nobody has approved yet: only a reviewer may look at it. The
+        // token alone is not enough, because every signed-in user can ask for one (it is read-only and
+        // carries the `preview` scope only, never a permission).
+        if ($tree === PreviewProxy::TREE_ONLINEPREVIEW && !$this->canReview()) {
+            return $this->plainError(403, $this->l10n->t('You do not have permission to review or publish articles.'));
+        }
+
         // one site: no id has to be read out of the token, the site is looked up directly
         $site = $this->registry->getSite();
         if ($site === null) {
@@ -109,7 +133,7 @@ class PreviewController extends BaseController
         $nonce = base64_encode($this->random->generate(16));
 
         try {
-            $result = $this->preview->fetch($path, $base, $siteUrl, $nonce);
+            $result = $this->preview->fetch($path, $base, $siteUrl, $nonce, $tree);
         } catch (\Throwable $e) {
             return $this->plainError(502, $e->getMessage(), $e instanceof BridgeException ? $e : null);
         }

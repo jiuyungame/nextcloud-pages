@@ -15,17 +15,19 @@ __pycache__/
 venv/
 *.egg-info/
 
-# The smoke tests' scratch directory
+# The smoke tests' scratch directory (the harness may name an alternate one)
 bridge/.test-tmp/
+bridge/.smoke-tmp/
 
-# Packaging and deployment output (tools/package.sh, scripts/release/package-app.sh)
+# Run logs of the live acceptance suites (tests/live/run-all.sh)
+tests/live/logs/
+
+# Packaging output (tools/package.sh)
 build/
-dist/
 *.tgz
 
 # Local scratch files
 .tmp*
-.deploy-assets.sha
 
 # Local bridge configuration: the real one carries the two secrets, and an effective.json
 # pushed by the app does too. The repository contains bridge/pages-bridge.toml.example only.

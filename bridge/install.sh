@@ -45,8 +45,11 @@ rm -rf "$PREFIX/pages_bridge"
 cp -r "$SRC_DIR/pages_bridge" "$PREFIX/pages_bridge"
 find "$PREFIX/pages_bridge" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
-say "creating the state directory $LIB"
-mkdir -p "$LIB/state" "$LIB/overrides" "$LIB/logs"
+say "creating the data directory $LIB"
+# work is the default work_root: the commit tree (a git history that cannot be regenerated) lives in
+# the same root as state/overrides/logs and is backed up with them. It holds source/ and online/
+# side by side; the two other trees next to it (work.preview, work.onlinepreview) are derived.
+mkdir -p "$LIB/work" "$LIB/state" "$LIB/overrides" "$LIB/logs"
 chmod 750 "$LIB"
 
 mkdir -p "$CONF_DIR"

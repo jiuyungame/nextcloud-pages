@@ -3,20 +3,21 @@
       xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
   <id>pages</id>
   <name>Pages</name>
-  <summary>Edit, build and publish static websites from Nextcloud</summary>
+  <summary>Edit, review and publish a Jekyll site from Nextcloud</summary>
   <description><![CDATA[
 # Pages
 
-Pages turns Nextcloud into the editing surface for a static website — Jekyll, Hugo,
-Eleventy, Astro, VitePress, or plain HTML — and takes it all the way to publication.
+Pages turns Nextcloud into the editing surface for a Jekyll site and takes it all the way to
+publication.
 
 ## What the app does
 
-- Browses and edits the site source **with Nextcloud's own file API**, so version
+- Authors write their own pages **with Nextcloud's own file API**, so version
   history, trash, sharing, desktop sync and activity all keep working
-- Rebuilds the site as you type and shows a live preview in the same page
-- Reviews the diff and publishes with a single click (or opens a pull request)
-- Shows the deployment status of the remote CI run
+- Rebuilds the site preview as authors save and shows it in the same page
+- Reviewers approve a page for the site and publish it: the publish is the git commit,
+  and a push follows when a git remote is configured
+- Reads the deployment as facts: head, commits the remote is ahead, unpublished files
 
 ## Deployment model
 
@@ -27,9 +28,10 @@ start host processes. So the work that needs a real shell — mirroring the sour
 into a working copy, running the site generator, and driving git — is done by
 `pages-bridge`, a small zero-dependency Python service that runs on the same host.
 
-The administrator installs that service once (the app hands you a ready-to-paste
-command with the secrets and paths already filled in), and from then on this app
-owns the configuration: sites are defined here and pushed to the bridge.
+The administrator installs that service once and pairs it from the Pages settings with a
+one-time code: the app generates both secrets, discovers the data directory and pushes the
+whole configuration. From then on this app owns the configuration of the instance's one
+site.
 
 Nothing is installed or started behind your back: enabling this app never touches
 files outside its own data directory.
@@ -40,7 +42,10 @@ Targets self-hosted deployments where the administrator can run a small service 
 the Nextcloud host. Instances that forbid `exec` and cannot run such a service fall
 back to a read/write editor without build or publish.
 ]]></description>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
+  <types>
+    <filesystem/>
+  </types>
   <licence>agpl</licence>
   <author homepage="https://github.com/hwshqtb">hwshqtb</author>
   <namespace>Pages</namespace>
@@ -69,12 +74,19 @@ back to a read/write editor without build or publish.
     <admin>OCA\Pages\Settings\Admin</admin>
     <admin-section>OCA\Pages\Settings\AdminSection</admin-section>
   </settings>
-  <!--
-    There is no static navigation declaration here on purpose: the preview is open to every signed-in
-    user, so the menu entry is registered at runtime in Application::boot() instead.
-  -->
+  <navigations>
+    <navigation>
+      <id>pages</id>
+      <name>Pages</name>
+      <route>pages.page.index</route>
+      <icon>app.svg</icon>
+      <order>2</order>
+      <type>link</type>
+    </navigation>
+  </navigations>
   <commands>
     <command>OCA\Pages\Command\BridgeConfig</command>
+    <command>OCA\Pages\Command\DeltaFlush</command>
     <command>OCA\Pages\Command\Doctor</command>
     <command>OCA\Pages\Command\Manifest</command>
     <command>OCA\Pages\Command\PushConfig</command>

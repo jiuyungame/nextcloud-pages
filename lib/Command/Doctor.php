@@ -10,6 +10,7 @@ use OCA\Pages\Service\ArticleReviewService;
 use OCA\Pages\Service\AuthorSourcesService;
 use OCA\Pages\Service\BridgeClient;
 use OCA\Pages\Service\BridgeException;
+use OCA\Pages\Service\DeltaQueue;
 use OCA\Pages\Service\FileService;
 use OCA\Pages\Service\PageUrlService;
 use OCA\Pages\Service\ReviewStore;
@@ -29,7 +30,8 @@ use Symfony\Component\Console\Output\OutputInterface;
 
 /**
  * `occ pages:doctor` — full-chain check of app config, bridge connectivity and protocol version,
- * the site folder and the build toolchain, with an actionable hint for every failing check.
+ * the site folder and author space, the deployment state and the app's routes/settings page, with an
+ * actionable hint for every failing check.
  */
 class Doctor extends Command
 {
@@ -37,6 +39,7 @@ class Doctor extends Command
     private ArticleReviewService $review;
     private ReviewStore $store;
     private PageUrlService $pageUrls;
+    private DeltaQueue $deltaQueue;
     private IL10N $l10n;
 
     public function __construct(
@@ -55,11 +58,13 @@ class Doctor extends Command
         ?ReviewStore $store = null,
         ?IFactory $l10nFactory = null,
         ?PageUrlService $pageUrls = null,
+        ?DeltaQueue $deltaQueue = null,
     ) {
         $this->authorSources = $authorSources ?? Server::get(AuthorSourcesService::class);
         $this->review = $review ?? Server::get(ArticleReviewService::class);
         $this->store = $store ?? Server::get(ReviewStore::class);
         $this->pageUrls = $pageUrls ?? Server::get(PageUrlService::class);
+        $this->deltaQueue = $deltaQueue ?? Server::get(DeltaQueue::class);
         // the factory rather than `Server::get(IL10N::class)`: that interface is registered in an app's
         // own container only, while the factory is a service of the server container and works either way
         $this->l10n = ($l10nFactory ?? Server::get(IFactory::class))->get(Application::APP_ID);
@@ -94,6 +99,27 @@ class Doctor extends Command
             $this->registry->secretFingerprint(SiteRegistry::KEY_SHARED_SECRET) ?: '(not configured)',
             'Generate it in the bridge TOML, then paste the same value into the admin settings here.',
         );
+
+        /*
+         * A reset that ran while the bridge was unreachable: the app side is clear, the bridge's trees
+         * are not. The row is retryable on purpose - running the reset again replays the bridge half and
+         * both ends are idempotent - so it is reported as a warning (the app itself works), not as a
+         * failure of the installation.
+         */
+        $pendingReset = $this->registry->getResetPending();
+        if ($pendingReset !== null) {
+            $add(
+                'bridge cleanup pending',
+                false,
+                sprintf(
+                    'the app was reset at %s, but pages-bridge did not confirm its cleanup: its work and preview trees are still in place',
+                    $pendingReset['at'] > 0 ? date('Y-m-d H:i', $pendingReset['at']) : '(unknown time)',
+                ),
+                'Start pages-bridge, then run the reset once more (admin settings → Pages → Danger zone). '
+                    . 'Both halves are idempotent, so the retry only cleans up what is left.',
+                true,
+            );
+        }
 
         // the two grants and the group lists that grant them; administrators always hold both, so an
         // empty list is "administrators only" and never "nobody". Publishing is part of reviewing
@@ -163,6 +189,31 @@ class Doctor extends Command
             );
         }
 
+        /*
+         * The durable queue of author deltas the bridge did not take. A save during a bridge restart
+         * is no longer lost - it is replayed at the next boot or by the command named here - but a
+         * non-empty queue still means the preview is missing files until that happens, so it is a
+         * warning (the app works, the site is behind) and not a failure of the installation.
+         */
+        $pendingDeltas = $this->deltaQueue->count();
+        $add(
+            'pending delta queue',
+            $pendingDeltas === 0,
+            $pendingDeltas === 0
+                ? '0 entries (every save reached the bridge)'
+                : sprintf(
+                    '%d entr%s waiting for replay (saved while the bridge was unreachable or restarting)',
+                    $pendingDeltas,
+                    $pendingDeltas === 1 ? 'y' : 'ies',
+                ),
+            $pendingDeltas === 0
+                ? null
+                : 'Run "occ pages:delta-flush" to replay them now. The next boot replays up to '
+                    . DeltaQueue::REPLAY_LIMIT . ' entries by itself once the bridge answers /health, '
+                    . 'so a restart of the bridge also drains the queue.',
+            $pendingDeltas > 0,
+        );
+
         // the site folder; this also exercises the Files API read path
         $site = $this->registry->getSite();
         // initialised here: the author-space check below reads it even when no site is configured yet
@@ -197,17 +248,23 @@ class Doctor extends Command
                         . 'so its files folder cannot be read (and the bridge resolves the source under that name).',
                 );
             } else {
-                $exists = $ncPath !== '' && $this->files->siteExists($ncUser, $ncPath);
+                $sitePath = rtrim($ncPath, '/');
+                // the site folder holds the three fixed subdirectories; the one the administrator
+                // maintains (and the bridge requires) is `source/`
+                $sourcePath = $sitePath === '' ? '' : $sitePath . '/' . \OCA\Pages\Service\SiteTrees::SOURCE;
+                $exists = $sourcePath !== '' && $this->files->siteExists($ncUser, $sourcePath);
                 $add(
                     'source folder',
                     $exists,
-                    $ncPath . ($exists ? ' ✓' : ' (missing)'),
-                    $exists ? null : 'Run "occ pages:push" and then POST .../apps/pages/api/site/init to let the bridge back-fill it.',
+                    ($sourcePath === '' ? '(not configured)' : $sourcePath) . ($exists ? ' ✓' : ' (missing)'),
+                    $exists
+                        ? null
+                        : 'Create the source/ directory inside the site folder (it holds the Jekyll skeleton), then "occ pages:push" (or save the site configuration once, which creates it for you).',
                 );
                 if ($exists) {
                     // really list the tree: this also exercises user-folder resolution, permissions and the Files API
                     try {
-                        $tree = $this->files->tree($ncUser, $ncPath);
+                        $tree = $this->files->tree($ncUser, $sourcePath);
                         $files = 0;
                         $dirs = 0;
                         foreach ($tree['nodes'] as $node) {
@@ -221,14 +278,28 @@ class Doctor extends Command
                     } catch (\Throwable $e) {
                         $add('site readable (Files API)', false, $e->getMessage(), 'Check permissions and ownership of that folder.');
                     }
+                    // the two directories the bridge writes: their presence is what "the site has a
+                    // version" and "something waits" mean, so a sentence with both counts is the
+                    // quickest answer to "why is nothing live / why is the queue empty"
+                    $served = $this->store->counts();
+                    $add(
+                        'content directories',
+                        true,
+                        sprintf('%d file(s) in online/ · %d in pending/', $served['online'], $served['pending']),
+                        $served['online'] === 0 && $served['pending'] === 0
+                            ? 'Nothing is published and nothing waits: approve a page in Manage, or use Apply source in the settings page.'
+                            : null,
+                    );
                 }
             }
         }
 
         // the author space: where each participating user keeps the files the app publishes for them
-        $this->checkAuthorSpace($add, $ncUser);
+        $this->checkAuthorSpace($add);
         // and the site's own view of that space: a mirror the site does not read is invisible
         $this->checkSiteAuthorSource($add, $site);
+        // the deployment: the publish repository's head, what the remote has, what Nextcloud holds
+        $this->checkDeployment($add, $site);
 
         // the bridge's view of the site: protocol 3 carries no site ids, so "in sync" means the
         // config revision the bridge loaded is the revision this app pushed last
@@ -242,7 +313,7 @@ class Doctor extends Command
                 $synced
                     ? sprintf('revision %d', $pushed)
                     : sprintf('the bridge loaded revision %d, the app pushed %d', $onBridge, $pushed),
-                $synced ? null : 'Use "Push to bridge" in the admin settings, or call POST /apps/pages/api/bridge/push (occ pages:push).',
+                $synced ? null : 'Call POST /apps/pages/api/bridge/push (occ pages:push): a save through the settings page already pushes, a scripted PUT /api/site does not.',
             );
         }
 
@@ -311,13 +382,10 @@ class Doctor extends Command
 
         // app navigation entry
         //
-        // The entry is no longer declared in info.xml: Application::boot() registers it at runtime so
-        // that it is skipped for anonymous requests (the preview is open to every signed-in user, so
-        // there is no group to restrict the entry to). What can be asserted here is the contract that
-        // registration depends on: the route must resolve, and the icon must be a real file that
-        // imagePath() can turn into a URL. A runtime entry is stored exactly as handed over, so a
-        // route or a bare icon name that only info.xml would expand leaves a menu tile without a
-        // link and without an icon - tests/verify-admin.sh asserts the resolved entry over HTTP.
+        // The entry is declared in info.xml (<navigations>), so the declaration is what has to hold:
+        // the route must resolve, and the icon must be a real file that imagePath() can turn into a
+        // URL. A route or a bare icon name the router cannot expand leaves a menu tile without a
+        // link and without an icon - tests/live/verify-admin.sh asserts the resolved entry over HTTP.
         $navRoute = Application::NAV_ROUTE;
         $navUrl = '';
         $navError = '';
@@ -356,7 +424,7 @@ class Doctor extends Command
         }
         $navOk = $navOk && $navIconUrl !== '' && is_file($navIconFile);
         $add(
-            'app navigation entry (registered at runtime)',
+            'app navigation entry (declared in info.xml)',
             $navOk,
             sprintf(
                 '%s (route=%s, icon=%s, order=%s) → %s',
@@ -370,8 +438,8 @@ class Doctor extends Command
             ),
             $navOk
                 ? null
-                : 'Application::boot() must register the entry through INavigationManager::add() with a '
-                    . 'resolved href (linkToRoute) and a resolved icon (imagePath); the icon file img/'
+                : 'info.xml (<navigations>) must declare this entry with a route that linkToRoute() resolves '
+                    . 'and an icon that imagePath() resolves; the icon file img/'
                     . $navIcon . ' has to exist.',
         );
 
@@ -428,7 +496,7 @@ class Doctor extends Command
         }
 
         // route *matching* cannot be verified here (no public API exposes the router's collection);
-        // scripts/deploy/deploy-app.sh probes every route with a real request instead.
+        // the live acceptance suites under tests/live/ probe the routes with real requests instead.
 
         // page routes must skip CSRF: a bare GET carries no requesttoken and is rejected after login
         $pageRoutes = [
@@ -538,6 +606,57 @@ class Doctor extends Command
     }
 
     /**
+     * The deployment: one row of **facts** about the publish repository and the remote.
+     *
+     * `HEAD <hash> · remote ahead N commits · M unpublished local files`. There is deliberately no
+     * "not pushed" label anywhere in this report: a publish is the commit, and a push either happened
+     * or was never possible, which the ahead count and the remote's presence already say.
+     *
+     * The row never fails the check: it describes a state, not a broken component. The ahead count is
+     * asked with a fetch (`/site/pull/preview`), because a stale number would be worse than none; a
+     * bridge that does not answer is reported as such and the remaining facts are left out.
+     *
+     * @param \Closure(string,bool,string,?string=,bool=):void $add
+     * @param array<string,mixed>|null $site
+     */
+    private function checkDeployment(\Closure $add, ?array $site): void
+    {
+        if ($site === null) {
+            return;
+        }
+        $remote = trim((string)($site['repo_url'] ?? '')) !== '';
+        try {
+            $preview = $this->bridge->pullPreview();
+        } catch (\Throwable $e) {
+            $add(
+                'deployment',
+                true,
+                $this->l10n->t('unknown (the bridge did not answer: %s)', [$e->getMessage()]),
+            );
+
+            return;
+        }
+
+        $head = trim((string)($preview['head'] ?? ''));
+        $ahead = $preview['remote_ahead'] ?? null;
+        $local = (int)($preview['local_unpublished'] ?? 0);
+        $facts = [
+            $head === '' ? $this->l10n->t('HEAD (no commit yet)') : $this->l10n->t('HEAD %s', [substr($head, 0, 12)]),
+        ];
+        if (!$remote) {
+            $facts[] = $this->l10n->t('no git remote configured');
+        } elseif (($preview['reachable'] ?? null) === false) {
+            $facts[] = $this->l10n->t('remote unreachable');
+        } else {
+            $facts[] = $ahead === null
+                ? $this->l10n->t('remote ahead: unknown')
+                : $this->l10n->t('remote ahead %s commit(s)', [(string)(int)$ahead]);
+        }
+        $facts[] = $this->l10n->t('%s unpublished local file(s)', [(string)$local]);
+        $add('deployment', true, implode(' · ', $facts));
+    }
+
+    /**
      * The site's own template configuration: which directory the site's author mirror reads.
      *
      * The app mirrors every author tree into `/<author_root>/<uid>/…` and the site's `_plugins/Authors.rb`
@@ -571,7 +690,7 @@ class Doctor extends Command
             $add(
                 'site author source',
                 true,
-                sprintf('no %s in %s (the template default %s applies)', PageUrlService::CONFIG_FILE, $ncPath, PageUrlService::DEFAULT_SOURCE),
+                sprintf('no %s in %s (the template default %s applies)', PageUrlService::CONFIG_FILE, rtrim($ncPath, '/') . '/' . \OCA\Pages\Service\SiteTrees::SOURCE, PageUrlService::DEFAULT_SOURCE),
                 $this->l10n->t(
                     'The site has no readable %1$s, so the author mirror falls back to its default directory %2$s. If the site is not the Jekyll authors template at all, ignore this; otherwise the app\'s author content directory (%3$s) has to be the same name.',
                     [PageUrlService::CONFIG_FILE, PageUrlService::DEFAULT_SOURCE, $root],
@@ -613,7 +732,7 @@ class Doctor extends Command
      *
      * @param \Closure(string,bool,string,?string=,bool=):void $add
      */
-    private function checkAuthorSpace(\Closure $add, string $ncUser): void
+    private function checkAuthorSpace(\Closure $add): void
     {
         $root = $this->registry->getAuthorRoot();
         $add(
@@ -641,13 +760,17 @@ class Doctor extends Command
         );
 
         $authors = $this->authorSources->authors();
+        // An empty authoring grant means "every signed-in user may author": a fresh install with no
+        // author content yet is not an error there. The failure belongs to the other case - a grant
+        // that nobody holds, which really does mean nobody may author.
+        $everyoneMayAuthor = $groups === [];
         $add(
             'authors',
-            $authors !== [],
-            $authors === []
-                ? '(nobody may author)'
-                : sprintf('%d author(s): %s', count($authors), implode(', ', array_slice($authors, 0, 8)) . (count($authors) > 8 ? ', …' : '')),
-            $authors === [] && $groups !== []
+            $authors !== [] || $everyoneMayAuthor,
+            $authors !== []
+                ? sprintf('%d author(s): %s', count($authors), implode(', ', array_slice($authors, 0, 8)) . (count($authors) > 8 ? ', …' : ''))
+                : ($everyoneMayAuthor ? '(no author content yet; every signed-in user may author)' : '(nobody may author)'),
+            $authors === [] && !$everyoneMayAuthor
                 ? 'None of the authoring groups has a member; add one, or clear the grant so every signed-in user may author.'
                 : null,
         );
@@ -708,31 +831,47 @@ class Doctor extends Command
             $counts = $this->review->counts();
             $stale = $this->review->staleRequests();
             $location = $this->store->location();
+            /*
+             * A manifest that is there but is not parsable is not "no manifest yet": it holds the
+             * decisions, it cannot be read, and every write over it is refused until it is repaired.
+             * That is a failure and not a warning - review actions stop working - and it is a check of
+             * its own so the row says "not valid JSON", not "not there yet".
+             */
+            $corrupt = $this->store->isCorrupt();
+            $add(
+                'visibility manifest parsable',
+                !$corrupt,
+                !$this->store->exists()
+                    ? $this->l10n->t('%s does not exist yet', [$location])
+                    : ($corrupt
+                        ? $this->l10n->t('%s is not valid JSON', [$location])
+                        : $this->l10n->t('%s is present', [$location])),
+                $corrupt
+                    ? $this->l10n->t(
+                        'The file is not overwritten, so nothing was lost: repair it by hand or restore it from a backup.',
+                    ) . ' ' . $this->l10n->t(
+                        'The next refused write copies the bytes aside as %s in the same folder.',
+                        [ReviewStore::CORRUPT_PREFIX . '*'],
+                    )
+                    : null,
+            );
             // A manifest that is not there while the site has author posts is a warning and not a
             // failure: it is created by the first visibility action (the same way an author area appears
             // with the first saved post), and until then every article reads as internal - which is the
             // honest answer for a site whose bookkeeping was never written.
             $noManifest = $posts > 0 && !$this->store->exists();
+            $served = $this->store->counts();
             $detail = $this->l10n->t(
-                'internal %d · requested %d · external %d · published files %d · manifest: %d article(s), %d published file(s) · %s',
+                'internal %d · requested %d · external %d · published files %d · manifest: %d entry(ies) · %s',
                 [
                     $counts[Article::STATE_INTERNAL] ?? 0,
                     $counts[Article::STATE_REQUESTED] ?? 0,
                     $counts[Article::STATE_EXTERNAL] ?? 0,
-                    $this->review->publishedCount(),
+                    $served['online'],
                     count($manifest['entries']),
-                    count($manifest['published']),
                     $location,
                 ],
             );
-            if ($this->store->legacyExists()) {
-                // a copy of the decisions is still in somebody's file tree: it decides nothing any more
-                // (appdata wins), but it is a writable record that should not stay there
-                $detail .= ' ' . $this->l10n->t(
-                    '(%s holds an old copy of the manifest; it is not read any more and can be deleted)',
-                    [$ncUser . '/' . ReviewStore::LEGACY_DIR . '/' . ReviewStore::FILE],
-                );
-            }
             $add(
                 'visibility states',
                 !$noManifest,

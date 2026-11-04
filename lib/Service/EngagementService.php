@@ -19,9 +19,9 @@ use OCP\IL10N;
  * Two boundaries are deliberate:
  *
  *  - **who may act on an article** is not decided here. {@see ArticleIndexService::single()} owns that
- *    answer - `live`, or the caller's own article, or the caller may publish - and every entry point of
- *    this class asks it rather than repeating the rule. A second copy of the rule would be a second
- *    answer the day one of them changes.
+ *    answer - `live`, or the caller's own article, or the caller may moderate (the review grant also
+ *    carries publishing) - and every entry point of this class asks it rather than repeating the rule.
+ *    A second copy of the rule would be a second answer the day one of them changes.
  *  - **what state an article is in** is not written here either: votes and comments are community data
  *    and never touch the review manifest ({@see ReviewStore}), which stays the only truth about a
  *    state.
@@ -82,10 +82,10 @@ final class EngagementService
     /**
      * The comment thread of an article, oldest first.
      *
-     * A deleted comment is gone for everybody except a caller with the publish grant, who sees it with
-     * `deleted` set: moderation has to be able to tell "no comment" from "a comment that was taken
-     * down", and the alternative - hiding the fact from the moderator as well - would make a mistake
-     * invisible while its row is still there.
+     * A deleted comment is gone for everybody except a caller with the review grant (which carries
+     * moderating), who sees it with `deleted` set: moderation has to be able to tell "no comment" from
+     * "a comment that was taken down", and the alternative - hiding the fact from the moderator as
+     * well - would make a mistake invisible while its row is still there.
      *
      * @return array{comments: list<array<string,mixed>>, count: int}
      * @throws NotFoundException when there is no such article
@@ -132,10 +132,11 @@ final class EngagementService
     /**
      * Deletes a comment (soft: the row stays, `deleted_at` is set).
      *
-     * The author may delete their own comment, a caller with the publish grant may delete any. Asking
-     * twice is not an error - the second call changes nothing and answers the same way - so a client
-     * that lost the first answer can simply try again. A comment that is already deleted is therefore
-     * answered with the current state instead of a 404, while an id nobody ever wrote is a 404.
+     * The author may delete their own comment, a caller with the review grant (which carries
+     * moderating) may delete any. Asking twice is not an error - the second call changes nothing and
+     * answers the same way - so a client that lost the first answer can simply try again. A comment
+     * that is already deleted is therefore answered with the current state instead of a 404, while an
+     * id nobody ever wrote is a 404.
      *
      * @return array{id: int, count: int, deletedAt: int}
      * @throws NotFoundException when no comment carries that id
@@ -164,7 +165,7 @@ final class EngagementService
 
     /**
      * The article a caller may act on, under the read rules of the index: the site has it, or it is the
-     * caller's own article, or the caller may publish.
+     * caller's own article, or the caller may moderate.
      *
      * "No such article" and "you may not see it" are two different answers, and the difference is the
      * article row: the index only lists articles it found as files, so a path with no row is unknown to
@@ -328,8 +329,8 @@ final class EngagementService
     }
 
     /**
-     * A target in the app's stored form (`/_posts/<uid>/<file>`). The same normalisation the review
-     * service applies, because both address the same rows by the same key.
+     * A target in the app's stored form (`/<author_root>/<uid>/<file>`). The same normalisation the
+     * review service applies, because both address the same rows by the same key.
      *
      * @throws \InvalidArgumentException when the path is empty or tries to walk up
      */

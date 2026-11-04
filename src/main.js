@@ -6,6 +6,9 @@ import { createApp } from 'vue'
 import { t } from './i18n.js'
 import App from './App.vue'
 import { readShellState } from './pageState.js'
+// The toasts App.vue raises are Nextcloud's own: their container and styling live in this package,
+// not in the server's page, so the app has to carry the stylesheet itself.
+import '@nextcloud/dialogs/style.css'
 import './global.css'
 
 // Lets the boot script (js/pages-boot.js) tell "bundle never ran" from "bundle ran but mount failed"
@@ -15,10 +18,9 @@ const host = document.getElementById('pages-app')
 if (host) {
 	try {
 		/*
-		 * The shell state is read here, once, and handed to the root component as a prop: the page
-		 * (`content` or `source`) and the two URLs are part of it, and reading the element a second
-		 * time inside the component would let the two reads drift apart. App.vue falls back to the
-		 * element itself when it is mounted without the prop.
+		 * The shell state is read here, once, and handed to the root component as a prop: reading the
+		 * element a second time inside the component would let the two reads drift apart. App.vue
+		 * falls back to the element itself when it is mounted without the prop.
 		 */
 		createApp(App, { shell: readShellState() }).mount(host)
 	} catch (error) {

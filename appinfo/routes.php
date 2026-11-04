@@ -17,16 +17,18 @@ return [
     'routes' => [
         // page
         //
-        // Two pages, one application: the content page (articles, review, reading) is for every
-        // signed-in user; the source page (Jekyll tree, whole-file editor, build and publish) is the
-        // work of an editor or a publisher. One page for both left authors with an empty navigation
-        // column and mixed the site's own files into what they were reading.
+        // One page, three views (edit / requests / read): the caller's own author area, the structured
+        // editor, the visibility requests, publishing and reading, for every signed-in user. The app
+        // no longer edits the site's own source folder - that folder's writers are the Files app /
+        // WebDAV, Import and Pull, and its content reaches the site through the publish pipeline.
         ['name' => 'page#index', 'url' => '/', 'verb' => 'GET'],
-        ['name' => 'page#source', 'url' => '/source', 'verb' => 'GET'],
 
         // admin config endpoints, admin only (the controller has no NoAdminRequired)
         ['name' => 'adminConfig#show', 'url' => '/api/admin/config', 'verb' => 'GET'],
         ['name' => 'adminConfig#update', 'url' => '/api/admin/config', 'verb' => 'PUT'],
+        // reset Pages back to a fresh install: admin only and password-confirmed, because it removes
+        // the configuration (the site folder and every author's files are never touched)
+        ['name' => 'reset#reset', 'url' => '/api/admin/reset', 'verb' => 'POST'],
 
         // the single site and its files
         ['name' => 'site#list', 'url' => '/api/site', 'verb' => 'GET'],
@@ -42,16 +44,24 @@ return [
         // the caller's own grant, addressed by nothing (the author is the caller)
         ['name' => 'site#pushAuthorSources', 'url' => '/api/site/push', 'verb' => 'POST'],
         ['name' => 'site#save', 'url' => '/api/site', 'verb' => 'PUT'],
-        // no DELETE: the one site of this instance cannot be removed, only reconfigured
-        // moving the source to another "site storage user" (§14): admin only, explicit, never implicit
-        // in a save — preflight reports what would happen, migrate performs it step by step
-        ['name' => 'site#preflight', 'url' => '/api/admin/site/preflight', 'verb' => 'POST'],
-        ['name' => 'site#migrate', 'url' => '/api/admin/site/migrate', 'verb' => 'POST'],
-        // first git pull / fetch from the remote: the bridge does both, only it can run git
+        // no DELETE: the one site of this instance cannot be removed, only reconfigured. Moving the
+        // source to another "site storage user" is locked once content exists and only the reset
+        // unlocks it (see ContentLock), so the retired preflight/migrate pair has no route any more.
+        // initialise the publish repository: the bridge creates it and fetches the remote's refs, and
+        // never checks anything out - Pull is the route that replaces the folder. Only it can run git.
         ['name' => 'site#init', 'url' => '/api/site/init', 'verb' => 'POST'],
+        // the author content directory's own channel: the bridge is the one writer of that value
+        ['name' => 'site#setAuthorRoot', 'url' => '/api/site/author-root', 'verb' => 'POST'],
+        // Pull: what the confirmation needs to say first (the ahead count and the number of
+        // unpublished local files), then the replacement itself
+        ['name' => 'site#pullPreview', 'url' => '/api/site/pull/preview', 'verb' => 'GET'],
         ['name' => 'site#pull', 'url' => '/api/site/pull', 'verb' => 'POST'],
+        // Import: a zip/tgz replaces the site folder through the Nextcloud file API (admin only)
+        ['name' => 'site#importSource', 'url' => '/api/site/source/import', 'verb' => 'POST'],
 
         ['name' => 'browse#tree', 'url' => '/api/site/tree', 'verb' => 'GET'],
+        // the author area's own file API: every one of these addresses a target of the caller's
+        // `<author_root>/<uid>/…` area, never a file of the site's source folder
         ['name' => 'browse#read', 'url' => '/api/site/file', 'verb' => 'GET'],
         ['name' => 'browse#write', 'url' => '/api/site/file', 'verb' => 'PUT'],
         ['name' => 'browse#create', 'url' => '/api/site/file', 'verb' => 'POST'],
@@ -85,19 +95,22 @@ return [
         ['name' => 'author#sources', 'url' => '/api/author/sources', 'verb' => 'GET'],
 
         // the visibility workflow: a page is internal until a reviewer approves it for the site.
-        // Exactly three actions - ask (request), withdraw (cancel), and the reviewer's answer
-        // (decision). The pending requests are read as the `requested` entries of /api/articles, and
-        // publishing stays at /api/site/publish: it stages everything external and the removals.
+        // Four actions - ask (request), withdraw (cancel), the reviewer's answer (decision), and the
+        // reviewer's own take-down of a page with nothing pending (take-down). An online request is
+        // what asks for content to go out, including the new content of an online page: the bridge
+        // freezes the bytes it names, so there is no separate update-request route any more. The
+        // pending requests are read as the `requested` entries of /api/articles, and publishing stays
+        // at /api/site/publish: it stages everything the site has a version of and the removals.
         // Reviewing and publishing are one permission (审核与发布): whoever decides may publish.
         ['name' => 'review#request', 'url' => '/api/article/request', 'verb' => 'POST'],
         ['name' => 'review#cancel', 'url' => '/api/article/cancel', 'verb' => 'POST'],
         ['name' => 'review#decision', 'url' => '/api/article/decision', 'verb' => 'POST'],
+        ['name' => 'review#takeDown', 'url' => '/api/article/take-down', 'verb' => 'POST'],
 
         // build and publish
         ['name' => 'build#status', 'url' => '/api/site/status', 'verb' => 'GET'],
         ['name' => 'build#build', 'url' => '/api/site/build', 'verb' => 'POST'],
         ['name' => 'build#notify', 'url' => '/api/site/notify', 'verb' => 'POST'],
-        ['name' => 'build#diff', 'url' => '/api/site/diff', 'verb' => 'GET'],
         ['name' => 'build#publish', 'url' => '/api/site/publish', 'verb' => 'POST'],
         ['name' => 'build#log', 'url' => '/api/site/log', 'verb' => 'GET'],
 

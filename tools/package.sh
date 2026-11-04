@@ -6,10 +6,10 @@
 #
 #   bash tools/package.sh          # package the current tree (run `npm run build` first)
 #
-# Whitelist: appinfo/ img/ js/ css/ l10n/ lib/ templates/ LICENSE README.md CHANGELOG.md
+# Whitelist: appinfo/ img/ js/ css/ l10n/ lib/ templates/ bridge/ LICENSE README.md CHANGELOG.md
 #
 # The archive is verified before the script reports success: the front-end bundles must be inside,
-# and src/, tests/, bridge/, scripts/, tools/, screenshots/, .github/ and every Python or node
+# and src/, tests/, tools/, screenshots/, .github/, Python byte-code and every node
 # artifact must not be. The version comes from appinfo/info.xml, so the archive cannot disagree
 # with what `occ app:list` reports.
 set -euo pipefail
@@ -34,6 +34,7 @@ WHITELIST=(
 	LICENSE
 	README.md
 	CHANGELOG.md
+    bridge
 )
 
 # The compiled bundles are committed, but a package with a missing one is an app that shows a blank
@@ -54,6 +55,49 @@ done
 [[ -f LICENSE ]] || die "missing LICENSE (the App Store requires one)"
 [[ -f appinfo/info.xml ]] || die "missing appinfo/info.xml (not an app directory?)"
 
+# ---------------------------------------------------------------- release gates
+say "pre-release checks"
+
+# PHP syntax: php -l when php exists, warn and skip otherwise
+php_files=$(find lib templates appinfo -name '*.php')
+if command -v php >/dev/null 2>&1; then
+	for f in $php_files; do php -l "$f" >/dev/null || die "PHP syntax error: $f"; done
+	echo "  ✓ PHP syntax OK ($(echo "$php_files" | wc -l) files)"
+else
+	warn "no php available, skipping php -l"
+fi
+
+# info.xml shape required by the App Store
+for tag in '<id>pages</id>' '<namespace>Pages</namespace>' '<licence>agpl</licence>' '<version>'; do
+	grep -q -- "$tag" appinfo/info.xml || die "appinfo/info.xml is missing $tag"
+done
+echo "  ✓ info.xml shape OK (id/namespace/licence/version)"
+
+# release gate: no hardcoded user name or private path may ship in the package
+# the scan is generic: the info.xml author name, plus a few private path shapes
+AUTHOR=$(sed -n 's:.*<author[^>]*>\([^<]*\)</author>.*:\1:p' appinfo/info.xml | head -1)
+SCAN_DIRS=(lib templates appinfo bridge/pages_bridge)
+PERSONAL_FILES=()
+
+if [[ -n "$AUTHOR" ]]; then
+	# the author name in code is a trace (in info.xml / README it is legitimate attribution)
+	while IFS= read -r hit; do
+		[[ -n "$hit" ]] && PERSONAL_FILES+=("author name '$AUTHOR': $hit")
+	done < <(grep -rIl --include='*.php' --include='*.py' --include='*.js' --include='*.vue' \
+		-F "$AUTHOR" "${SCAN_DIRS[@]}" 2>/dev/null || true)
+fi
+
+# private / local-machine paths
+while IFS= read -r hit; do
+	[[ -n "$hit" ]] && PERSONAL_FILES+=("local path: $hit")
+done < <(grep -rIl -E '/mnt/[a-z]/|/root/site/|/home/[a-z]+/' "${SCAN_DIRS[@]}" 2>/dev/null || true)
+
+if [[ ${#PERSONAL_FILES[@]} -gt 0 ]]; then
+	die "package contains personal environment traces, clean them before releasing:
+$(printf '    %s\n' "${PERSONAL_FILES[@]}")"
+fi
+echo "  ✓ no personal environment traces (author name '${AUTHOR:-undeclared}' absent from code; no local paths)"
+
 rm -rf "$STAGE"
 mkdir -p "$STAGE/$APP_ID"
 
@@ -64,6 +108,10 @@ done
 
 echo "  staged: ${WHITELIST[*]}"
 
+# the bridge ships, its build artefacts do not
+find "$STAGE" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
+find "$STAGE" -name "*.pyc" -delete 2>/dev/null || true
+rm -rf "$STAGE/$APP_ID/bridge/.test-tmp"
 tar -czf "$OUT" -C "$STAGE" "$APP_ID"
 rm -rf "$STAGE"
 
@@ -75,10 +123,9 @@ LIST=$(tar -tzf "$OUT")
 grep -qx "$APP_ID/js/pages-main.js" <<<"$LIST" || die "the archive does not contain $APP_ID/js/pages-main.js"
 
 FORBIDDEN=(
+    '*.pyc'
 	'src/'
 	'tests/'
-	'bridge/'
-	'scripts/'
 	'tools/'
 	'screenshots/'
 	'.github/'
@@ -93,15 +140,15 @@ done
 if grep -Eq "^$APP_ID/(package(-lock)?\.json|vite\.config\.js|\.gitignore|\.nextcloudignore)$" <<<"$LIST"; then
 	die "the archive contains a development-only root file (package.json / vite.config.js / ignore file)"
 fi
-if grep -Eq '\.(py|pyc|pyo|map)$' <<<"$LIST"; then
-	die "the archive contains Python sources, byte code or a source map"
+if grep -qE '__pycache__|\.pyc$|\.map$' <<<"$LIST"; then
+	die "the archive contains Python byte-code or a source map"
 fi
 if grep -Eq '(^|/)\.git/' <<<"$LIST"; then
 	die "the archive contains git metadata"
 fi
 
-echo "  ✓ no src/, tests/, bridge/, scripts/, tools/, screenshots/, .github/, node_modules/"
-echo "  ✓ no Python sources or byte code, no source maps, no git metadata"
+echo "  ✓ no src/, tests/, tools/, screenshots/, .github/, node_modules/; bridge ships without byte-code"
+echo "  ✓ no Python byte-code or test artefacts, no source maps, no git metadata"
 echo "  ✓ js/pages-main.js present"
 
 if command -v du >/dev/null 2>&1; then

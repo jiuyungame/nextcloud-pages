@@ -18,8 +18,11 @@ use OCP\IUserManager;
  * ({@see ReviewStore}) is the truth about the workflow: which state an author's article is in and
  * whether the site has it. The database holds only the community state (votes, comments) plus a cache
  * of the title, the tags and the review trail, so a scan reads the source tree, registers what it
- * finds, and **never deletes anything**: a row whose file disappeared is simply no longer listed, and
- * removing published content stays an explicit publisher action (see the plan's §9).
+ * finds, and **never deletes anything**: a row whose file disappeared is no longer listed from the
+ * tree, and removing published content stays an explicit publisher action (see the plan's §9). The one
+ * exception is an entry with something pending: its source file can already be gone (the delete paths
+ * leave a take-off request behind) and it still has to be listed, or the reviewer could never answer
+ * the request and the page would stay on the site forever ({@see self::collect()}).
  */
 final class ArticleIndexService
 {
@@ -71,15 +74,28 @@ final class ArticleIndexService
     }
 
     /**
-     * The reading list: every page of the site, filterable by tag, by visibility state and by "approved
-     * for the site only". Reading needs no visibility filter of its own: a signed-in user sees every
-     * entry that exists and belongs to the site, and each row says which of the three states it is in.
+     * The reading list: every page of the site, filterable by tag, by visibility state and by "the
+     * site has a version of it". Reading needs no visibility filter of its own: a signed-in user sees
+     * every entry that exists and belongs to the site, and each row says which of the three states it
+     * is in.
+     *
+     * `$awaiting` is the request panel's narrower question: only entries with a candidate waiting in
+     * `pending/` ({@see ReviewStore::isPending()}). It is one filter and not a fourth state - an online
+     * page whose new content waits is still on the site, with its old version. An entry whose author is
+     * still editing is deliberately **not** in it: the author decides whether the new content should go
+     * out, and only their online request freezes it.
      *
      * @return array{articles: list<array<string,mixed>>, truncated: bool}
      */
-    public function listed(string $viewerUid, string $tag = '', string $sort = 'new', string $state = '', bool $externalOnly = false): array
-    {
-        return $this->select($viewerUid, 'published', $tag, $sort, $state, $externalOnly);
+    public function listed(
+        string $viewerUid,
+        string $tag = '',
+        string $sort = 'new',
+        string $state = '',
+        bool $externalOnly = false,
+        bool $awaiting = false,
+    ): array {
+        return $this->select($viewerUid, 'published', $tag, $sort, $state, $externalOnly, $awaiting);
     }
 
     /**
@@ -95,6 +111,11 @@ final class ArticleIndexService
     /**
      * One article with its community data, or null when it does not exist. No visibility filtering:
      * being signed in and naming an entry of the site is enough, and the row carries the state.
+     *
+     * The row comes from {@see self::collect()} with the caller as the viewer: the workflow is
+     * reported through the folder-derived fields (`published`, `candidate`, `downRequest`), which are a
+     * fact of the review workflow and are handed to anyone who may see the article - the request panel
+     * reads them for other people's pages.
      *
      * @return array<string,mixed>|null
      */
@@ -145,9 +166,9 @@ final class ArticleIndexService
      * Register (or refresh) a single article without walking the whole tree.
      *
      * The author's own save path calls this, so a brand new author is already in the database when the
-     * next configuration push asks who the authors are. An existing row keeps its visibility state:
-     * editing a page is not a visibility change, and there is no content review that an edit could take
-     * back - a page that is `external` stays approved for the site while it is being corrected.
+     * next scan asks who the authors are. An existing row keeps its visibility state: editing a page
+     * is not a visibility change, and there is no content review that an edit could take back - a page
+     * that is `external` stays approved for the site while it is being corrected.
      */
     public function register(string $uid, string $area, string $rel, string $target): void
     {
@@ -178,37 +199,29 @@ final class ArticleIndexService
      * Whether the site is serving an article right now.
      *
      * Two independent facts, and this is where they meet:
-     *  - **is the entry approved for the site?** ({@see ReviewStore::onSite()}): a page that was taken
-     *    down (`internal`) is not live any more, even though the site serves the old commit until the
-     *    next publish; a pending take-offline request is still approved, so it stays live.
-     *  - **did a commit carry it?** The manifest's published list answers that for an author's article.
-     *    The site's own posts are not tracked there: an editor publishes them with the site, and the
-     *    commit plus Jekyll's `published:` flag is the answer.
+     *  - **is the article approved for the site?** `online/<target>` is the answer
+     *    ({@see ReviewStore::isLive()}): a page that was taken down is not live any more, even though
+     *    the built site keeps the old output until the next build; a pending take-offline request is
+     *    still served, so it stays live.
+     *  - **the site's own posts** are not tracked in `online/`: an editor publishes them with the site,
+     *    and the build plus Jekyll's `published:` flag is the answer.
      *
-     * The rule is static and public because the tree, the reading list and the publish step ask the
-     * same question, and two answers to "is it live" would drift apart.
-     *
-     * @param array<string,mixed> $item owner/state/intent/path, as the scan or a cache row describes it
-     * @param array<string,mixed> $manifest the visibility manifest, as `ReviewStore::read()` returned it
+     * @param array<string,mixed> $item owner/state/path, as the scan or a cache row describes it
      */
-    public static function isLive(array $item, array $manifest): bool
+    public function isLive(array $item): bool
     {
-        if (!ReviewStore::onSite($manifest, (string)($item['path'] ?? ''))) {
-            return false;
-        }
         if (($item['owner'] ?? '') === '') {
-            // the site's own posts: the commit plus Jekyll's `published:` flag is the switch, and the
-            // scan keeps the state in step with the file
+            // the site's own posts: the build plus Jekyll's `published:` flag is the switch
             return ($item['state'] ?? '') === Article::STATE_EXTERNAL;
         }
 
-        return ReviewStore::isPublished($manifest, (string)($item['path'] ?? ''));
+        return $this->review->isLive((string)($item['path'] ?? ''));
     }
 
     /**
      * @return array{articles: list<array<string,mixed>>, truncated: bool}
      */
-    private function select(string $viewerUid, string $scope, string $tag, string $sort, string $state = '', bool $externalOnly = false): array
+    private function select(string $viewerUid, string $scope, string $tag, string $sort, string $state = '', bool $externalOnly = false, bool $awaiting = false): array
     {
         $items = [];
         foreach ($this->collect($viewerUid) as $item) {
@@ -216,9 +229,14 @@ final class ArticleIndexService
                 if ($item['owner'] !== $viewerUid) {
                     continue;
                 }
-            } elseif (!($item['renderable'] ?? true)) {
+            } elseif (!($item['renderable'] ?? true)
+                && ($item['candidate'] ?? false) !== true
+                && ($item['downRequest'] ?? false) !== true) {
                 // an image or another non-renderable entry has no article page: it is listed in the
-                // author's own tree only, not in the reading list
+                // author's own tree only, not in the reading list. An entry with something pending is
+                // the exception: its source file may already be gone, and the request it carries must
+                // stay visible to the reviewer who has to answer it - in the request panel and in any
+                // list the requested state is asked for.
                 continue;
             }
             if ($tag !== '' && !$this->hasTag($item['tags'], $tag)) {
@@ -231,6 +249,12 @@ final class ArticleIndexService
             }
             // "approved for the site only": the filter the external list asks for
             if ($externalOnly && (string)$item['state'] !== Article::STATE_EXTERNAL) {
+                continue;
+            }
+            // "a frozen candidate is waiting for a decision": the request panel's own list. It is the
+            // author's *request* - the bytes were frozen when they asked - and not merely an edit, so
+            // an entry whose author has not asked yet stays out of the queue.
+            if ($awaiting && ($item['candidate'] ?? false) !== true) {
                 continue;
             }
             // `live` is decided per item by the scan, from the manifest it read once: an approved entry
@@ -293,6 +317,11 @@ final class ArticleIndexService
      * The manifest is read once per scan and then asked per article: a page view must not read the same
      * file once per post.
      *
+     * A path no tree yielded is added a second time from the manifest when it carries a pending
+     * request: the file is gone, but the reviewer still has to decide about the entry (see step 3 at
+     * the end of {@see self::collect()}). A path whose file is gone and has nothing pending stays out -
+     * it is a removal the next publish carries out, not an article.
+     *
      * @return list<array<string,mixed>>
      */
     private function collect(string $viewerUid): array
@@ -307,18 +336,29 @@ final class ArticleIndexService
             return [];
         }
         $manifest = $this->review->read();
+        // A manifest that could not be read is not an empty one: every author entry is then unknown
+        // rather than `internal`, so the states the cache already holds are the only answer there is
+        // and this scan must not "repair" them from the empty document it got instead
+        // ({@see ReviewStore::isCorrupt()}).
+        $corrupt = $this->review->isCorrupt();
+        // read once for the whole scan: whether the last publish's push was attempted and failed. An
+        // entry carried by that commit is live but not on the remote, which is exactly what the row's
+        // `pushFailed` flag reports.
+        $pushFailed = $this->registry->getPublishPushFailure() !== null;
 
         // the site's own permalink pattern, read once: author area paths are relative to their own
-        // folder, so the pattern is the same for every source of this site
-        $pattern = $this->files->siteExists($owner, $ncPath)
-            ? $this->permalinkPattern($owner, $ncPath)
+        // folder, so the pattern is the same for every source of this site. The skeleton lives in
+        // `source/` since the three-directory layout, so the pattern and the posts are read there.
+        $sourcePath = rtrim($ncPath, '/') . '/' . SiteTrees::SOURCE;
+        $pattern = $this->files->siteExists($owner, $sourcePath)
+            ? $this->permalinkPattern($owner, $sourcePath)
             : FrontMatter::DEFAULT_PERMALINK;
 
-        // 1. the skeleton: `_posts/…` of the site folder, unowned
+        // 1. the skeleton: `_posts/…` of the site's `source/` folder, unowned
         $scanned = [];
-        if ($this->files->siteExists($owner, $ncPath)) {
+        if ($this->files->siteExists($owner, $sourcePath)) {
             try {
-                $tree = $this->files->tree($owner, $ncPath);
+                $tree = $this->files->tree($owner, $sourcePath);
             } catch (\Throwable) {
                 $tree = ['nodes' => []];
             }
@@ -330,7 +370,7 @@ final class ArticleIndexService
                 if (!$this->isPost($rel)) {
                     continue;
                 }
-                $scanned['/' . ltrim($rel, '/')] = ['reader' => $owner, 'owner' => '', 'root' => $ncPath, 'rel' => $rel, 'node' => $node];
+                $scanned['/' . ltrim($rel, '/')] = ['reader' => $owner, 'owner' => '', 'root' => $sourcePath, 'rel' => $rel, 'node' => $node];
                 if (count($scanned) >= self::MAX_ARTICLES * 2) {
                     break;
                 }
@@ -367,7 +407,24 @@ final class ArticleIndexService
                 }
             }
         }
-        if ($scanned === []) {
+        /*
+         * The requests the walk cannot find. The scan describes files that exist, while a deleted
+         * file's take-off request (`sourceDeleted: true`, filed by both delete paths) is a fact of the
+         * manifest alone, and a candidate whose source was deleted is a fact of `pending/` alone: the
+         * entry has to stay in the lists - the request panel and the counts - until a reviewer answers
+         * it, or nobody ever can and the page stays on the site forever.
+         */
+        $pending = [];
+        foreach (array_keys($manifest['entries']) as $key) {
+            $key = (string)$key;
+            if (ReviewStore::downRequestOf($manifest, $key) !== null) {
+                $pending['/' . ltrim($key, '/')] = $key;
+            }
+        }
+        foreach ($this->review->pendingTargets() as $key) {
+            $pending['/' . ltrim($key, '/')] = $key;
+        }
+        if ($scanned === [] && $pending === []) {
             return [];
         }
 
@@ -384,13 +441,12 @@ final class ArticleIndexService
             // an author post is the manifest's to decide about, the skeleton's own history keeps
             // following Jekyll's `published` flag
             $followFile = $authorUid === '';
-            $mtime = (int)($source['node']['mtime'] ?? 0);
             $renderable = $authorUid === '' ? true : $this->authorAreas()->isRenderable((string)$source['rel']);
             $parsed = ['data' => [], 'body' => ''];
             if ($renderable) {
                 try {
-                    // the file is the truth for title/date/tags/URL, so it is read every time; only the
-                    // stored cache is written when the row is new or the file changed
+                    // the file is the truth for title/date/tags/URL, so it is read every time; the
+                    // stored cache is written only when the row is new or its parse differs
                     $raw = (string)($this->files->read($reader, $source['root'], $source['rel'])['content'] ?? '');
                 } catch (\Throwable) {
                     // binary, too large, or gone between the walk and the read: not an article
@@ -408,37 +464,63 @@ final class ArticleIndexService
                 $tags = [];
             }
             // the skeleton follows its front matter (`published:` true means the site builds it, i.e.
-            // `external`); an author's article follows the manifest, where a path it does not mention
-            // is `internal` (whether the site *has* it is the published list, not the file)
+            // `external`); an author's article follows the folders, where `online/` means the site
+            // serves it and a take-down request means something waits
             $state = $followFile
                 ? (FrontMatter::isPublished($data) ? Article::STATE_EXTERNAL : Article::STATE_INTERNAL)
-                : ReviewStore::stateOf($manifest, $path);
-            $entry = ReviewStore::entryOf($manifest, $path);
-
-            if ($row === null) {
-                $row = $this->articles->upsertByPath($path, $authorUid, $title, implode(' ', $tags));
-            } elseif ($mtime > (int)$row->getUpdatedAt() || (string)$row->getOwnerUid() !== $authorUid) {
-                $row = $this->articles->upsertByPath($path, $authorUid, $title, implode(' ', $tags));
+                : $this->review->stateIn($manifest, $path);
+            if ($corrupt && !$followFile && $row !== null) {
+                // nothing to derive a state from: keep the one the cached row already carries, so a
+                // page that is on the site does not read as a draft just because the manifest is
+                // unreadable
+                $state = (string)$row->getState();
             }
-            if ((string)$row->getState() !== $state) {
+            $entry = ReviewStore::entryOf($manifest, $path);
+            // the entry's own facts, read once: the direction of a pending request, the candidate in
+            // pending/ (and since when), the take-offline request and the version the site serves. A
+            // site-owned post has no entry at all - its state and `live` follow the file
+            $intent = $followFile ? '' : $this->review->intentIn($manifest, $path);
+            $candidateAt = $followFile ? 0 : $this->review->pendingStamp($path);
+            $isPending = $followFile ? false : $this->review->isPending($path);
+            $downRequest = $followFile ? null : ReviewStore::downRequestOf($manifest, $path);
+            $publishedAt = $followFile ? 0 : $this->review->liveStamp($path);
+            $isLive = $followFile ? $state === Article::STATE_EXTERNAL : $this->review->isLive($path);
+
+            // The file is the truth, so the title and the tags are parsed on every pass; the cache row
+            // is written only when what it holds differs from what the file says. Comparing the fields
+            // themselves is exact - both columns are a projection of the parse - and it is the only
+            // test that cannot ask for a write when nothing changed: the file-mtime-against-
+            // `updated_at` heuristic it replaces was a proxy, and every write it did trigger rewrote
+            // the same two values (and moved the very timestamp the next pass compared against).
+            $tagsLine = implode(' ', $tags);
+            if ($row === null
+                || (string)$row->getOwnerUid() !== $authorUid
+                || (string)$row->getTitle() !== $title
+                || (string)$row->getTags() !== $tagsLine) {
+                $row = $this->articles->upsertByPath($path, $authorUid, $title, $tagsLine);
+            }
+            if (!$corrupt && (string)$row->getState() !== $state) {
                 // The manifest is the truth about a state, so a row that says something else is a stale
                 // cache - a hand-edited or restored manifest, or a row written before the manifest
                 // existed. Repairing it here (and not only on the next write) is what keeps the queue
                 // and the counts, which are plain queries, in step with what the pages show. The entry's
                 // own fields travel along, so a repair never clears a review note.
+                //
+                // It never runs over a corrupt manifest: `read()` answers the empty document there, and
+                // writing that back would erase every state the table still holds - the one copy left
+                // until the file is repaired.
                 $row = $this->articles->saveState(
                     (int)$row->getId(),
                     $state,
                     (string)($entry['note'] ?? ''),
-                    (int)($entry['submittedAt'] ?? 0),
-                    (int)($entry['publishedAt'] ?? 0),
-                    (string)($entry['revision'] ?? ''),
+                    // the queue reads the moment the pending request was filed (either direction),
+                    // and the panel the moment the served version was last written
+                    $candidateAt > 0 ? $candidateAt : ($downRequest['at'] ?? 0),
+                    $publishedAt,
+                    '',
                 );
             }
             $rows[$path] = $row;
-            // the pending request, as the author's own list and the request panel have to show it: the
-            // intent is the direction the author asked for, and it is empty unless `requested`
-            $intent = $followFile ? '' : ReviewStore::intentOf($manifest, $path);
 
             $item = [
                 'id' => (int)$row->getId(),
@@ -459,15 +541,84 @@ final class ArticleIndexService
                 // back. It comes from the manifest, which is the decision's own record.
                 'reviewNote' => (string)($entry['note'] ?? ''),
                 'decidedBy' => (string)($entry['decidedBy'] ?? ''),
-                'submittedAt' => (int)($entry['submittedAt'] ?? 0),
-                'publishedAt' => (int)($entry['publishedAt'] ?? 0),
-                'revision' => (string)($entry['revision'] ?? ''),
+                // the moment the pending request was filed (either direction), 0 while none is
+                'submittedAt' => $candidateAt > 0 ? $candidateAt : ($downRequest['at'] ?? 0),
+                // the moment the site's version was last written, 0 while it has none
+                'publishedAt' => $publishedAt,
+                // the folder-derived facts: whether the site serves a version, whether one waits in
+                // pending/ (and since when), and whether a take-offline request is waiting. A
+                // site-owned post has no entry at all - its state and `live` follow the file
+                'published' => $isLive,
+                'candidate' => $isPending,
+                'candidateAt' => $candidateAt,
+                'downRequest' => $downRequest !== null,
+                // whether the author's file is already gone. This row came from the scan, which just
+                // found the file, so the answer is no - whatever the request recorded before the file
+                // came back is history. The decision reads the filesystem at decision time
+                // ({@see \OCA\Pages\Service\ArticleReviewService::decide()}), and the display has to
+                // report the same current fact; only the pending-only rows below have no file to read.
+                'sourceDeleted' => false,
             ];
-            // decided here, where the manifest is already in hand: the reading list, the tag counts and
+            // decided here, where the folders are already in hand: the reading list, the tag counts and
             // the single-article endpoint all ask the same question
-            $item['live'] = self::isLive($item, $manifest);
+            $item['live'] = $this->isLive($item);
+            // a live entry is shown as Online; when the last publish's push was attempted and failed,
+            // the same entry is marked `pushFailed` - the commit carried it, the remote did not get it
+            $item['pushFailed'] = $item['live'] && $pushFailed;
             $articles[] = $item;
             $bodies[$path] = $renderable ? FrontMatter::summary($parsed['body']) : '';
+        }
+
+        // 3. an entry whose source file is gone but whose request still waits for a decision. It has
+        //    no file to read, so everything an article normally takes from one - title, date, URL,
+        //    tags, whether it can be rendered - is empty or derived from the path; what the reviewer
+        //    decides about (the request, the served version, the trail) comes from the manifest, like
+        //    every other row. Paths the scan did collect are skipped: the file is the better answer.
+        $collected = [];
+        foreach ($articles as $article) {
+            $collected[(string)$article['path']] = true;
+        }
+        foreach ($pending as $path => $key) {
+            if (isset($collected[$path])) {
+                continue;
+            }
+            $entry = ReviewStore::entryOf($manifest, $key);
+            $owner = trim((string)($entry['owner'] ?? ''));
+            $candidateAt = $this->review->pendingStamp($key);
+            $isPending = $this->review->isPending($key);
+            $downRequest = ReviewStore::downRequestOf($manifest, $key);
+            $publishedAt = $this->review->liveStamp($key);
+            $isLive = $this->review->isLive($key);
+            // the cache row may still be there (the file was indexed while it existed): its id and
+            // the decision trail keep the community data and the review note attached to the row
+            $row = $rows[$path] ?? null;
+            $item = [
+                'id' => $row !== null ? (int)$row->getId() : 0,
+                'path' => $path,
+                'title' => basename($path),
+                'owner' => $owner,
+                'author' => $this->displayName($owner, $names),
+                'tags' => [],
+                'state' => $this->review->stateIn($manifest, $key),
+                'intent' => $this->review->intentIn($manifest, $key),
+                'renderable' => false,
+                'date' => 0,
+                'url' => '',
+                'reviewNote' => (string)($entry['note'] ?? ''),
+                'decidedBy' => (string)($entry['decidedBy'] ?? ''),
+                'submittedAt' => $candidateAt > 0 ? $candidateAt : ($downRequest['at'] ?? 0),
+                'publishedAt' => $publishedAt,
+                'published' => $isLive,
+                'candidate' => $isPending,
+                'candidateAt' => $candidateAt,
+                'downRequest' => $downRequest !== null,
+                // no source file was scanned for this row: the request's recorded flag is the only
+                // fact there is, and the decision would read the same absent file
+                'sourceDeleted' => ($downRequest['sourceDeleted'] ?? false) === true,
+            ];
+            $item['live'] = $this->isLive($item);
+            $item['pushFailed'] = $item['live'] && $pushFailed;
+            $articles[] = $item;
         }
 
         return $this->withCommunity($articles, $bodies, $viewerUid);
@@ -502,19 +653,19 @@ final class ArticleIndexService
     }
 
     /**
-     * The users whose author areas are scanned, resolved the same way the push resolves them: the
-     * members of the authoring groups, or every administrator when no group is granted (which is the
-     * same "everyone" the authoring capability uses). A user whose folder does not exist contributes
-     * nothing, so an install that never configured this costs one folder lookup per admin.
+     * The users whose author areas are scanned: the members of the authoring groups and everyone who
+     * already owns an article (exactly the list AuthorSourcesService::authors() builds), plus the
+     * viewer. A user whose folder does not exist contributes nothing, so an install that never
+     * configured this costs one folder lookup per author.
      *
      * @return list<string>
      */
     private function authorUids(string $viewerUid = ''): array
     {
-        // One authority for "who is an author": the same list the configuration push uses, so the
-        // index and the bridge can never disagree about whose folder belongs to the site. The viewer
+        // One authority for "who is an author": the same list the repair scan and the overwrite use, so
+        // the index and the bridge can never disagree about whose folder belongs to the site. The viewer
         // is always added: an author has to see their own new article immediately, even before the
-        // first push has told the bridge - and the database - that they are an author.
+        // first scan has told the database that they are an author.
         $uids = [];
         try {
             foreach ($this->authorSources->authors() as $uid) {

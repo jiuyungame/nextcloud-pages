@@ -10,10 +10,9 @@
  * @var array $_
  */
 $state = [
-    // which of the app's two pages this is: the content page or the site source page
-    'page' => ($_['page'] ?? 'content') === 'source' ? 'source' : 'content',
-    // who is asking: the front end tells "my own entry" from somebody else's with it (nobody decides
-    // about their own request)
+    // who is asking: the front end uses it to mark the caller's own entries in the list. The decision
+    // rules do not look at the owner: a reviewer may decide about any entry, their own included, and
+    // `decidedBy` records who answered.
     'uid' => (string)($_['uid'] ?? ''),
     // the two grants, as the server decided them: authoring, and 审核与发布 (reviewing and publishing
     // are one permission, so `canReview`, `canEdit` and `canPublish` all report it under the names the
@@ -25,9 +24,6 @@ $state = [
     'isAdmin' => $_['isAdmin'] ?? false,
     // single site: one object, never a list (no id, no name — the title is basename(nc_path))
     'site' => is_array($_['site'] ?? null) ? $_['site'] : [],
-    // the two pages link to each other, so neither has to build a URL by hand
-    'contentUrl' => $_['contentUrl'] ?? '',
-    'sourceUrl' => $_['sourceUrl'] ?? '',
 ];
 if (array_key_exists('bridgeUrl', $_)) {
     // administrators only: the config revision and the bridge connection metadata
@@ -39,6 +35,7 @@ if (array_key_exists('bridgeUrl', $_)) {
         'protocol' => $_['protocol'] ?? 0,
     ];
 }
+// printed unescaped below, so the JSON_HEX_* flags are what keeps a value from closing the script tag
 $json = json_encode($state, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE);
 ?>
 <div id="pages-app" class="pages-app">

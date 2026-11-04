@@ -15,8 +15,9 @@
 #      and the [site] table here. The bridge is then paired from the start, the app is configured
 #      with the same shared_secret, and nothing else changes.
 #
-# Every path must be absolute. The source directory, the work copy (the commit tree) and the
-# preview directory (the tree the build runs in) are validated not to contain each other.
+# Every path must be absolute. The source directory, the work copy (the commit tree, data), the
+# review tree (data) and the preview directory (derived, the tree the build runs in) are validated
+# not to contain each other.
 
 listen = "127.0.0.1:8787"
 
@@ -26,7 +27,8 @@ listen = "127.0.0.1:8787"
 #
 # Leave both out to pair from the Nextcloud app; set them (at least 16 characters each, generate
 # with `python3 -m pages_bridge gen-secret`) to run the hand-written path. Once the app has paired,
-# the values it pushed live in <state_dir>/effective.json and these are no longer used.
+# the values it pushed live in <state_dir>/effective.json (the state_dir above) and these are no
+# longer used.
 #
 # shared_secret          = "REPLACE_ME"
 # session_signing_secret = "REPLACE_ME"
@@ -36,20 +38,26 @@ listen = "127.0.0.1:8787"
 # process can read and write it directly. The app pushes the value it discovers during pairing.
 nc_data_root = "/var/snap/nextcloud/common/nextcloud/data"
 
-# Root of the site's directories. Single site: the **commit tree** (the git working tree a
-# publish commits from) is this directory itself unless the [site] table below sets an explicit
-# work_path — there is no <work_root>/<site> level. The **preview tree** is a sibling of it:
-# <work_root>.preview by default (see preview_dir under [site]).
+# Root of the site's host trees. Single site: the **commit tree** (the git working tree a publish
+# commits from) is this directory itself unless the [site] table below sets an explicit work_path
+# — there is no <work_root>/<site> level. Its siblings are the **review tree**
+# (<work_root>.onlinepreview) and the **preview tree** (<work_root>.preview).
 #
-# Defaults to **/tmp** on purpose: both trees are disposable build/commit caches, the
-# Nextcloud source is the only source of truth. The system clearing /tmp (or a WSL
-# restart) is expected — the bridge re-clones (see do_mirror / do_init in server.py),
-# so do not treat it as a data directory.
-work_root    = "/tmp/pages"
+# All three trees are DERIVED from the site folder in Nextcloud:
+#   work          = <nc_path>/source + <nc_path>/online
+#   preview       = <nc_path>/source + <nc_path>/online + every author folder
+#   onlinepreview = <nc_path>/source + <nc_path>/online + <nc_path>/pending
+# so they may be deleted and rebuilt at any time (Apply source / POST /site/mirror). The default
+# is **/var/lib/pages/work**, in the same persistent root as state_dir/override_dir/log_dir; the
+# only non-regenerable piece is the git history in work/.git, which comes from the remote or the
+# next commit. A missing work tree is rebuilt from source/ + online/, never a fatal state.
+work_root    = "/var/lib/pages/work"
 
 # State / override files / logs owned by the bridge. All outside the work tree.
 # effective.json (the configuration the app pushed, secrets included, mode 0600) and the
-# one-time pairing.json live in state_dir.
+# one-time pairing.json live in state_dir — and they stay here even when the app pushes another
+# state_dir: those bootstrap files are read before (or without) the pushed configuration.
+# The reset marker (reset-unpaired.flag) lives here too.
 state_dir    = "/var/lib/pages/state"
 override_dir = "/var/lib/pages/overrides"
 log_dir      = "/var/lib/pages/logs"
@@ -110,23 +118,31 @@ unexclude = []
 # Site directory that receives every author's whole tree: author A's files are mirrored to
 # "<author_root>/<A>/…". One path segment, starting with a letter or a digit (no "/", no "..",
 # no leading "." or "_", because the site's own Jekyll directories start that way). Defaults to
-# "tmp" when absent, so an app that predates this field keeps publishing, and the two legacy
-# areas ("_posts/<uid>/…" and "assets/authors/…") stay accepted either way.
+# "tmp" when absent, so an app that predates this field keeps publishing.
 # author_root  = "tmp"
 #
-# Commit tree (an ordinary git working tree). It holds the site's own files plus the author
-# files that are **on the site** (the `on_site` list the app pushes); it is never built, so it
-# has no build output. Defaults to work_root itself (/tmp/pages). A hard-coded value works too,
-# but it must not sit inside the source directory or contain it (the config validation rejects
-# that), and it must not be the preview directory.
-# work_path    = "/tmp/pages"
+# Commit tree (an ordinary git working tree, and the flat repository a publish pushes). The tree
+# root is the Jekyll site: source/ is copied there first, then online/ overwrites the same names.
+# It is never built, so it has no build output. Defaults to work_root itself
+# (/var/lib/pages/work). A hard-coded value works too, but it must not
+# sit inside the source directory or contain it (the config validation rejects that), and it must
+# not be the review or preview directory. The online layer is written by `publish` only — no source
+# file ever enters it.
+# work_path    = "/var/lib/pages/work"
 #
-# Preview tree: the second directory. It holds every author file (internal and external alike)
-# plus the site's own files, and the **build runs here**; the preview route serves its
-# output_dir. It must be an absolute path outside the work copy (validated: neither may contain
-# the other). Defaults to a sibling of the work copy: <work_path or work_root>.preview.
+# Preview tree: a **derived** directory. It holds every author file (internal and external alike)
+# plus the site's own files, and the **build runs here**; the preview route serves its output_dir.
+# It may be deleted and rebuilt from the sources at any time. It must be an absolute path outside
+# the work copy (validated: neither may contain the other). Defaults to a sibling of the work copy:
+# <work_path or work_root>.preview.
 # The app pushes this field like the other site fields (derived from the work root it pushes).
-# preview_dir  = "/tmp/pages.preview"
+# preview_dir  = "/var/lib/pages/work.preview"
+#
+# Review tree: **data**, not a cache. It holds the published content with the frozen candidate
+# snapshots laid over it; with no pending candidate it is byte-for-byte equal to the commit tree.
+# Only `candidate`/`publish`/`discard`/`take-down` move a target in or out of it. Defaults to a
+# sibling: <work_path or work_root>.onlinepreview. Same separation rules as the preview directory.
+# onlinepreview_dir = "/var/lib/pages/work.onlinepreview"
 #
 # repo_url     = "git@github.com:your-name/your-site.git"
 # remote_name  = "origin"
@@ -157,9 +173,11 @@ unexclude = []
 # ── Author sources (optional: the app pushes them) ───────────────────────────
 #
 # One site, several Nextcloud folders: every author keeps writing in **their own** files and
-# the bridge mirrors the files they name into the site's two directories. The app normally
-# pushes this list inside its own `site` object; the TOML form below is the hand-written
-# equivalent (and a working seed for `install.sh`).
+# the app names the target each of their files belongs to. Only the **preview tree** mirrors
+# those folders; an author's file reaches the **commit tree** when it is approved (a candidate
+# is frozen into the review tree, then published). The app normally pushes this list inside its
+# own `site` object; the TOML form below is the hand-written equivalent (and a working seed for
+# `install.sh`). The current app is event-driven and does not push it at all.
 #
 # Rules, all of them deliberate:
 #
@@ -168,34 +186,36 @@ unexclude = []
 #     not overlap the site's own source (or either directory).
 #   * `entries[].target` is a path in the site and may only be
 #     "<author_root>/<uid>/…" (that author's whole tree: any depth, any file type - images are
-#     mirrored too), or the legacy "_posts/<uid>/…" (that author's posts) and
-#     "assets/authors/<uid>.css" / "assets/authors/<uid>/<slug>.css" (that author's stylesheet).
-#     Anything else - the site's own files, another author's area - is refused when the config is
-#     loaded. `author_root` is the [site] field above; the validation and the skeleton mirror's
-#     exclusion list are derived from that one value, so they cannot disagree.
-#   * `entries` is mirrored into the **preview tree**: everything the author's area holds, so an
-#     internal page is built and previewable. `on_site` (the same entry shape) is the subset that
-#     is approved for the site and is mirrored into the **commit tree**; absent means "the same as
-#     entries", which is the single-tree behaviour of an older app.
-#   * `removed` holds **targets** (already site-relative), never source paths: the bridge never
-#     maps a source file to a target on its own. Only what is named there is ever deleted from
-#     either tree, and even that goes through mirror_delete_guard_*.
+#     mirrored too). Anything else - the site's own files, another author's area, another root -
+#     is refused when the config is loaded. `author_root` is the [site] field above; the validation
+#     and the skeleton mirror's exclusion list are derived from that one value, so they cannot
+#     disagree.
+#   * Apply source (the `mirror` op / POST /site/mirror) lays the author's **whole folder** over
+#     the preview tree: `<nc_data_root>/<uid>/files/<path>/<rel>` becomes
+#     `<author_root>/<uid>/<rel>`. The app normally names the authors on the request
+#     (`authors: [{uid, area}]`); this table is the hand-written equivalent and the fallback.
+#   * `entries[].target` is validated for compatibility with an older client, but the assembly
+#     no longer uses the mapping: a file always lands at `<author_root>/<uid>/<rel>`.
+#   * `on_site` is accepted and **ignored**: the published record is `online/` in Nextcloud.
+#   * `removed` holds **targets** (already site-relative), never source paths. It is used by the
+#     one-shot `overwrite` repair of the preview tree; a source-side deletion in the steady state
+#     is the explicit `remove` op, and a published copy is only removed by a take-down.
 #   * A file that disappeared from an author's folder is reported as `missing` and is **not**
 #     deleted; if the author's folder itself is gone, that round deletes nothing at all.
-#   * A page that is turned internal (still in the area, no longer approved) leaves the commit
-#     tree at the next mirror and stays in the preview tree; it is not reported `removed`.
+#   * A page that is turned internal (still in the area, no longer approved) stays in the preview
+#     tree and is not reported `removed`; its published copy is untouched by the mirror.
 #
 # [[site.authors]]
 # uid   = "bob"                  # <nc_data_root>/bob/files/Pages/posts/...
 # path  = "/Pages/posts"
 # removed = [                    # targets the app has decided are gone; empty on a first run
-#   "_posts/bob/2026-04-01-old.md",
-#   "assets/authors/bob/2026-04-01-old.css",
+#   "tmp/bob/2026-04-01-old.md",
+#   "tmp/bob/2026-04-01-old.css",
 # ]
 #
 # [[site.authors.entries]]
 # path   = "2026-05-01-hello.md"                       # in bob's folder
-# target = "_posts/bob/2026-05-01-hello.md"            # the legacy post shape
+# target = "tmp/bob/2026-05-01-hello.md"               # the author's post under author_root
 #
 # [[site.authors.entries]]
 # path   = "images/pic.png"
@@ -203,12 +223,12 @@ unexclude = []
 #
 # [[site.authors.entries]]
 # path   = "theme.css"
-# target = "assets/authors/bob.css"                    # the per-author stylesheet
+# target = "tmp/bob/theme.css"                         # a stylesheet in the author's tree
 #
 # [[site.authors.entries]]
 # path   = "2026-05-01-hello.css"
-# target = "assets/authors/bob/2026-05-01-hello.css"   # one post's sibling stylesheet
+# target = "tmp/bob/2026-05-01-hello.css"              # one post's sibling stylesheet
 #
-# [[site.authors.on_site]]                              # the approved subset (commit tree)
+# [[site.authors.on_site]]                              # accepted and ignored (online/ is the record)
 # path   = "2026-05-01-hello.md"
-# target = "_posts/bob/2026-05-01-hello.md"
+# target = "tmp/bob/2026-05-01-hello.md"

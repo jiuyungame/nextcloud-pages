@@ -7,14 +7,15 @@ namespace OCA\Pages\Command;
 use OCA\Pages\Service\AuthorSourcesService;
 use OCA\Pages\Service\BridgeClient;
 use OCA\Pages\Service\BridgeException;
+use OCA\Pages\Service\SiteLayout;
 use OCA\Pages\Service\SiteRegistry;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
 /**
- * `occ pages:push` — pushes the app's site configuration to pages-bridge; the command-line
- * equivalent of the "Push to bridge" button, for scripted deploys and troubleshooting.
+ * `occ pages:push` — pushes the app's site configuration to pages-bridge; the scriptable equivalent
+ * of the write-through a settings save performs, for deploys and troubleshooting.
  *
  * Exit codes are the retry taxonomy, not a boolean: `0` pushed, `1` failed, `2` the bridge did not
  * answer at all and the same command may simply be run again. A timer or a CI step can tell "the
@@ -32,6 +33,7 @@ class PushConfig extends Command
         private SiteRegistry $registry,
         private BridgeClient $bridge,
         private AuthorSourcesService $authorSources,
+        private SiteLayout $layout,
     ) {
         parent::__construct();
     }
@@ -50,9 +52,11 @@ class PushConfig extends Command
             return self::EXIT_FAILED;
         }
         try {
-            // the authors' folders travel with the site, exactly like the settings page's push: a
-            // push without them would drop every author from the bridge (the pushed site replaces
-            // the previous one), which is the opposite of what this command is for
+            // the bridge refuses a site whose skeleton directory is missing: make sure `source/` is
+            // there before the push, exactly like a settings save does
+            $this->layout->ensureSource();
+            // author content is not part of this payload any more: the file-event deltas and the
+            // one-shot overwrite carry it, so this pushes the site configuration only
             $result = $this->authorSources->pushWithAuthors($this->bridge);
         } catch (BridgeException $e) {
             // the same record a failing save writes, so `pages:doctor` can report a push that was
@@ -79,6 +83,12 @@ class PushConfig extends Command
                 '<comment>Exit %d: the bridge answered and refused this configuration, so repeating the command cannot help; fix the reported cause first.</comment>',
                 self::EXIT_FAILED,
             ));
+
+            return self::EXIT_FAILED;
+        } catch (\Throwable $e) {
+            // the layout guard (a site folder that cannot be created, a storage user that is gone)
+            // is not a bridge answer: nothing was pushed and nothing can be retried without a fix
+            $output->writeln('<error>' . $e->getMessage() . '</error>');
 
             return self::EXIT_FAILED;
         }

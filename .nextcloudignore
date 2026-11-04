@@ -12,15 +12,11 @@
 /.gitignore
 /.nextcloudignore
 /build
-/dist
-/.deploy-assets.sha
 
-# Development-only trees: sources, tests, the host daemon, docs scripts, screenshots
+# Development-only trees: sources, tests, the host daemon, release tooling, screenshots
 /src
 /tests
 /tools
-/bridge
-/scripts
 /screenshots
 
 # Node tooling: the bundles are committed, so a package never builds anything

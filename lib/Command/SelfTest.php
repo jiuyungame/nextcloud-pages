@@ -64,6 +64,9 @@ class SelfTest extends Command
         $failures = [];
 
         $output->writeln(sprintf('<info>site</info> %s  <info>user</info> %s', $ncPath, $user));
+        // the site folder holds the three fixed subdirectories; the skeleton (and therefore a probe
+        // page the build has to pick up) lives in `source/`
+        $ncPath = rtrim($ncPath, '/') . '/' . \OCA\Pages\Service\SiteTrees::SOURCE;
 
         // ---- pure-function check: preview rewriting ----
         $failures = array_merge($failures, $this->checkRewriting($output));

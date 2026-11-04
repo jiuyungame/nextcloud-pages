@@ -8,6 +8,7 @@ import shlex
 import signal
 import subprocess
 import time
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +53,12 @@ class BuildResult:
     timed_out: bool = False
     errors: list[dict] = field(default_factory=list)
     log_tail: str = ""
+    #: Which tree was built: ``"preview"`` (the author preview) or ``"onlinepreview"`` (the review
+    #: copy). Both are recorded in their own state key, and this key says which one a record is.
+    tree: str = "preview"
+    #: Which bundle the build ran with: ``"vendored"`` (the recipe's env, gems under ``BUNDLE_PATH``)
+    #: or ``"system"`` (the host's gems, with ``BUNDLE_PATH``/``BUNDLE_BIN`` removed).
+    bundle_mode: str = "vendored"
 
     def to_dict(self) -> dict:
         return {
@@ -68,10 +75,13 @@ class BuildResult:
             "timed_out": self.timed_out,
             "errors": self.errors[:30],
             "log_tail": self.log_tail,
+            "tree": self.tree,
+            "bundle_mode": self.bundle_mode,
         }
 
 
 def _yaml_scalar(value: object) -> str:
+    """Render one scalar for the generated overrides; strings are quoted so they stay strings."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
@@ -94,12 +104,17 @@ def write_overrides(site: Site, cfg: Config) -> Path | None:
     return target
 
 
-def build_argv(site: Site, cfg: Config) -> list[str]:
-    """Assemble the final build command; jekyll is the only preset there is."""
+def build_argv(site: Site, cfg: Config, output_dir: Path | None = None) -> list[str]:
+    """Assemble the final build command; jekyll is the only preset there is.
+
+    ``output_dir`` names the destination: left out it is the preview's ``site.output_dir``, and the
+    review build passes ``site.onlinepreview_output_dir`` so the two trees never write into the same
+    place. Everything else (the overrides file, ``--config``) is the same for both.
+    """
     if not site.recipe.command:
         return []
     argv = list(site.recipe.command)
-    output = str(site.output_dir)
+    output = str(site.output_dir if output_dir is None else output_dir)
 
     # the generated overrides chain onto the site's own config file
     override = write_overrides(site, cfg)
@@ -111,30 +126,112 @@ def build_argv(site: Site, cfg: Config) -> list[str]:
     return argv
 
 
-def _needs_install(site: Site) -> bool:
-    """Whether dependencies must be installed; jekyll is the only generator, so bundler decides."""
+def _needs_install(site: Site, root: Path | None = None) -> bool:
+    """Whether dependencies must be installed; jekyll is the only generator, so bundler decides.
+
+    ``root`` is the tree the build runs in (the preview, or the review copy): ``bundle check`` has to
+    inspect the bundler state of that tree, never the other tree's.
+
+    ``bundle check`` is the whole answer: exit 0 means every gem of the bundle is installed, any
+    non-zero exit means it is incomplete and the install step runs. An ``OSError`` or a timeout
+    counts as "needs install" too - a bundler that cannot even be started, or does not answer in
+    90 s, proves nothing about the gems.
+    """
     if not site.recipe.install_cmd:
         return False
+    cwd = site.preview if root is None else root
+    # recipe.env is required here: without BUNDLE_PATH, bundler inspects system gems
+    env = {
+        **os.environ,
+        "HOME": os.environ.get("HOME", "/root"),
+        "LC_ALL": "C",
+        **{k: str(v) for k, v in site.recipe.env.items()},
+    }
     # let bundler itself report whether the gems are present
     try:
         proc = subprocess.run(
             ["bundle", "check"],
-            cwd=str(site.preview),
+            cwd=str(cwd),
             capture_output=True,
             text=True,
             timeout=90,
-            # recipe.env is required here: without BUNDLE_PATH, bundle check inspects system gems
-            env={
-                **os.environ,
-                "HOME": os.environ.get("HOME", "/root"),
-                "LC_ALL": "C",
-                **{k: str(v) for k, v in site.recipe.env.items()},
-            },
+            env=env,
             shell=False,
         )
-        return proc.returncode != 0
     except (OSError, subprocess.TimeoutExpired):
         return True
+    return proc.returncode != 0
+
+
+def _local_fallback_argv(install_cmd: Sequence[str] | None) -> list[str] | None:
+    """The same install command as a pure local install, or ``None`` when that makes no sense.
+
+    Only bundler is retried: ``bundle install --local`` resolves the Gemfile against the gems
+    already installed on this host, which is exactly what a build needs when the gem source is
+    refusing requests (403) or unreachable but the gems are present. Any other install command is
+    left exactly as the recipe wrote it - appending a flag it does not know would turn a network
+    problem into a usage error.
+    """
+    argv = list(install_cmd or [])
+    if not argv or Path(argv[0]).name != "bundle":
+        return None
+    return argv + ["--local"]
+
+
+#: The keys the recipe uses to point bundler inside the tree. The ``system`` bundle mode removes
+#: them (it must not set them to ``""``), so bundler resolves against the gems installed on the host.
+SYSTEM_BUNDLE_KEYS: tuple[str, ...] = ("BUNDLE_PATH", "BUNDLE_BIN")
+
+#: How long one ``bundle exec <tool> --version`` probe may take before it counts as "unusable".
+_BUNDLE_PROBE_TIMEOUT = 60
+
+
+def _exec_tool(command: Sequence[str] | None) -> str | None:
+    """The executable a ``bundle exec`` build command runs (``bundle exec jekyll build`` -> ``jekyll``).
+
+    ``None`` when the command does not go through ``bundle exec``: such a recipe has no bundler
+    state to probe, and the build is not a bundler build at all.
+    """
+    argv = list(command or [])
+    for index, word in enumerate(argv[:-1]):
+        if Path(word).name != "bundle" or argv[index + 1] != "exec":
+            continue
+        if index + 2 < len(argv):
+            return Path(argv[index + 2]).name
+    return None
+
+
+def _bundle_env(mode: str, recipe_env: Mapping[str, str]) -> tuple[dict[str, str], tuple[str, ...]]:
+    """The ``extra_env``/``drop_env`` pair that addresses one bundle mode.
+
+    ``vendored`` is the recipe's environment unchanged: bundler installs and looks for the gems
+    under ``BUNDLE_PATH`` (``vendor/bundle``), inside the tree. ``system`` is the same environment
+    with ``BUNDLE_PATH`` and ``BUNDLE_BIN`` **removed** - not emptied - so bundler falls back to the
+    gems installed on the host. That is the only way an empty ``vendor/`` can still build.
+    """
+    env = {key: str(value) for key, value in recipe_env.items()}
+    if mode == "system":
+        return env, SYSTEM_BUNDLE_KEYS
+    return env, ()
+
+
+def _bundle_works(tool: str, root: Path, mode: str, recipe_env: Mapping[str, str]) -> bool:
+    """Whether ``bundle exec <tool> --version`` really runs in ``root`` with this bundle mode.
+
+    A real executable is the question, not ``bundle check``: bundler can report a complete bundle
+    while the build executable is missing (an empty ``vendor/`` with ``BUNDLE_PATH`` set makes
+    jekyll unreachable), and ``bundle exec true`` answers 0 even then. ``--version`` is the cheapest
+    command every generator answers.
+    """
+    extra_env, drop_env = _bundle_env(mode, recipe_env)
+    code, _out, timed_out = _run_capture(
+        ["bundle", "exec", tool, "--version"],
+        cwd=root,
+        timeout=_BUNDLE_PROBE_TIMEOUT,
+        extra_env=extra_env,
+        drop_env=drop_env,
+    )
+    return not timed_out and code == 0
 
 
 def _run_capture(
@@ -142,14 +239,22 @@ def _run_capture(
     cwd: Path,
     timeout: int,
     extra_env: dict[str, str] | None = None,
+    drop_env: Iterable[str] = (),
 ) -> tuple[int, str, bool]:
-    """Run a command, return ``(exit code, merged output, timed out)``; a timeout kills the process group."""
+    """Run a command, return ``(exit code, merged output, timed out)``; a timeout kills the process group.
+
+    ``extra_env`` is layered over the process environment, then ``drop_env`` **removes** keys from
+    the result: a mode that has to unset a variable (``BUNDLE_PATH`` for the system gems) cannot
+    express that by setting it to ``""``.
+    """
     env = dict(os.environ)
     env.setdefault("HOME", "/root")
     env["LC_ALL"] = "C.UTF-8"
     env["JEKYLL_ENV"] = env.get("JEKYLL_ENV", "production")
     if extra_env:
         env.update({k: str(v) for k, v in extra_env.items()})
+    for key in drop_env:
+        env.pop(key, None)
 
     proc = subprocess.Popen(
         argv,
@@ -177,6 +282,7 @@ def _run_capture(
 
 
 def _kill_group(proc: subprocess.Popen, hard: bool = False) -> None:
+    """Kill the whole process group (a build's own children included), else the single process."""
     sig = signal.SIGKILL if hard else signal.SIGTERM
     try:
         os.killpg(os.getpgid(proc.pid), sig)
@@ -236,72 +342,198 @@ def extract_errors(log: str, limit: int = 50) -> list[dict]:
 
 
 def _persist_log(
-    cfg: Config, site: Site, build_id: int, argv: list[str],
+    cfg: Config, build_id: int, argv: list[str],
     code: int, ok: bool, ms: int, files: int, log: str,
+    *,
+    log_name: str = f"{ARTIFACT_STEM}.log",
+    ts: float | None = None,
+    bundle_mode: str | None = None,
 ) -> None:
-    """Persist the full output of one attempt."""
-    # install failures land here too, otherwise the UI shows only exit=N with no log
-    (cfg.log_dir / f"{ARTIFACT_STEM}.log").parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(
-        cfg.log_dir / f"{ARTIFACT_STEM}.log",
-        f"# build {build_id} @ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\n"
-        f"# cmd: {shlex.join(argv)}\n"
-        f"# exit={code} ok={ok} ms={ms} files={files}\n\n{log}",
-    )
+    """Persist the full output of one attempt under that tree's own log file."""
+    stamp = time.localtime(ts if ts is not None else time.time())
+    path = cfg.log_dir / log_name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# build {build_id} @ {time.strftime('%Y-%m-%d %H:%M:%S', stamp)}",
+        f"# cmd: {shlex.join(argv)}",
+        f"# exit={code} ok={ok} ms={ms} files={files}",
+    ]
+    if bundle_mode:
+        lines.append(f"# bundle: {bundle_mode}")
+    atomic_write_text(path, "\n".join(lines) + f"\n\n{log}")
 
 
-def run_build(site: Site, cfg: Config, state: SiteState) -> BuildResult:
-    """Build the **preview** tree; the commit tree is never built.
+def _onlinepreview_log_name() -> str:
+    """The review tree's log file, next to the preview's: one build, one log."""
+    return f"{ARTIFACT_STEM}.onlinepreview.log"
 
-    ``site.preview`` is the directory every author's files are mirrored into, so the build input is
-    the whole site and the preview can show an internal page. ``site.output_dir`` is inside that
-    tree, which is what the preview route serves; nothing here reads or writes ``site.work``.
+
+def _record_build(state: SiteState, record: dict, review: bool) -> None:
+    """Store one build record in the key of the tree it belongs to.
+
+    The two trees are built independently, so they are recorded independently: a review build must
+    never overwrite ``last_build``, which is the author preview the app reads, and a preview build
+    must never look like the review tree's last result.
     """
+    if review:
+        state.record_onlinepreview_build(record)
+    else:
+        state.record_build(record)
+
+
+def run_build(site: Site, cfg: Config, state: SiteState, *, tree: str = "preview") -> BuildResult:
+    """Build one tree; the commit tree is never built.
+
+    ``tree="preview"`` is the author preview: ``site.preview`` is the working directory,
+    ``site.output_dir`` the destination, and the record replaces ``state.last_build``.
+    ``tree="onlinepreview"`` is the reviewer's copy: ``site.onlinepreview`` in,
+    ``site.onlinepreview_output_dir`` out, its own log file (``<artifact>.onlinepreview.log``) and
+    its own state record (``state.last_onlinepreview_build``). Any other value keeps the preview
+    behaviour, which is what every caller that predates the third tree means.
+
+    The bundle mode is resolved before anything is installed. The recipe's own environment
+    (``vendored``: gems under ``BUNDLE_PATH``) and then the host's gems (``system``: the same
+    environment without ``BUNDLE_PATH``/``BUNDLE_BIN``) are each asked for a real
+    ``bundle exec <tool> --version``; the first that answers builds, with that environment, and
+    nothing is installed. Only when neither answers is an install attempted, and the build then runs
+    with the environment that install produced (see the attempt chain below).
+    """
+    review = tree == "onlinepreview"
+    root = site.onlinepreview if review else site.preview
+    output = site.onlinepreview_output_dir if review else site.output_dir
+    log_name = _onlinepreview_log_name() if review else f"{ARTIFACT_STEM}.log"
+
     build_id = state.next_build_id
     started = time.monotonic()
     ts = time.time()
 
-    site.preview.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
 
+    # ── which bundle builds this tree: the vendored one, or the host's gems ─────────────────────
+    bundle_mode = "vendored"
+    extra_env, drop_env = _bundle_env("vendored", site.recipe.env)
     installed = False
     install_ms = 0
-    if _needs_install(site):
-        info("installing dependencies", cmd=shlex.join(site.recipe.install_cmd or []))
+
+    tool = _exec_tool(site.recipe.command)
+    probe_resolved = False
+    if tool is not None:
+        if _bundle_works(tool, root, "vendored", site.recipe.env):
+            probe_resolved = True
+        elif _bundle_works(tool, root, "system", site.recipe.env):
+            bundle_mode = "system"
+            extra_env, drop_env = _bundle_env("system", site.recipe.env)
+            probe_resolved = True
+            info(
+                "the vendored bundle is unusable; building with the system gems",
+                tool=tool,
+                dropped=list(SYSTEM_BUNDLE_KEYS),
+            )
+    # A recipe that does not run through ``bundle exec`` has nothing to probe; for it the old
+    # ``bundle check`` still decides whether an install is needed.
+    needs_install = False
+    if not probe_resolved and site.recipe.install_cmd:
+        needs_install = _needs_install(site, root) if tool is None else True
+    if needs_install:
+        install_cmd = list(site.recipe.install_cmd or [])
+        install_timeout = max(600, cfg.build_timeout_s * 3)
+        # The vendored environment first; then the same command against the local gem cache; and
+        # last the system gems, because an empty ``vendor/`` is exactly what ``BUNDLE_PATH`` points
+        # at, and no amount of ``--local`` finds the gems the host already has through it.
+        attempts: list[tuple[list[str], str]] = [(install_cmd, "vendored")]
+        local = _local_fallback_argv(install_cmd)
+        if local is not None:
+            attempts.append((local, "vendored"))
+            attempts.append((local, "system"))
+        info("installing dependencies", cmd=shlex.join(install_cmd), mode="vendored")
         t0 = time.monotonic()
-        code, out, timed_out = _run_capture(
-            list(site.recipe.install_cmd or []),
-            cwd=site.preview,
-            timeout=max(600, cfg.build_timeout_s * 3),
-            # the install step needs recipe.env too, or bundler writes to a read-only system path
-            extra_env=dict(site.recipe.env),
-        )
+        history: list[tuple[list[str], str, int, str, bool]] = []
+        code, out, timed_out = 0, "", False
+        for index, (attempt_argv, attempt_mode) in enumerate(attempts):
+            if index:
+                info(
+                    "dependency install failed, retrying",
+                    cmd=shlex.join(attempt_argv),
+                    mode=attempt_mode,
+                    exit=code,
+                )
+            attempt_env, attempt_drop = _bundle_env(attempt_mode, site.recipe.env)
+            code, out, timed_out = _run_capture(
+                attempt_argv,
+                cwd=root,
+                timeout=install_timeout,
+                # the install step needs recipe.env too, or bundler writes to a read-only system path
+                extra_env=attempt_env,
+                drop_env=attempt_drop,
+            )
+            history.append((attempt_argv, attempt_mode, code, out, timed_out))
+            if timed_out or code == 0:
+                # a timeout proves nothing and is never retried; success ends the chain
+                break
+        bundle_mode = history[-1][1]
+        extra_env, drop_env = _bundle_env(bundle_mode, site.recipe.env)
         install_ms = int((time.monotonic() - t0) * 1000)
         installed = True
         if timed_out or code != 0:
             clean = _ANSI.sub("", out)
+            command = history[-1][0]
             result = BuildResult(
                 build_id=build_id,
                 ok=False,
                 ts=ts,
                 ms=int((time.monotonic() - started) * 1000),
                 exit_code=code,
-                command=list(site.recipe.install_cmd or []),
-                output_dir=str(site.output_dir),
+                command=command,
+                output_dir=str(output),
                 installed=True,
                 install_ms=install_ms,
                 timed_out=timed_out,
-                errors=extract_errors(out),
+                errors=extract_errors(clean),
                 log_tail=tail_lines(clean, cfg.log_tail_lines),
+                tree=tree,
+                bundle_mode=bundle_mode,
             )
-            _persist_log(cfg, site, build_id, result.command, code, False, result.ms, 0, clean)
-            state.record_build(result.to_dict())
-            warn("dependency install failed", exit=code, timed_out=timed_out)
+            # the log keeps every attempt; the structured tail is the last one, the failure that
+            # actually stopped the build
+            if len(history) == 1:
+                persisted = clean
+            else:
+                sections = []
+                for index, (a_argv, a_mode, a_code, a_out, a_timed_out) in enumerate(history, start=1):
+                    head = (
+                        f"# install attempt {index}: {shlex.join(a_argv)} "
+                        f"(mode {a_mode}, exit {a_code}{', timed out' if a_timed_out else ''})"
+                    )
+                    body = _ANSI.sub("", a_out)
+                    if index < len(history):
+                        body = tail_lines(body, cfg.log_tail_lines)
+                    sections.append(f"{head}\n{body}")
+                persisted = "\n\n".join(sections)
+            _persist_log(
+                cfg, build_id, command, code, False, result.ms, 0, persisted,
+                log_name=log_name, ts=ts, bundle_mode=bundle_mode,
+            )
+            # the log first, the record second: a recorded build always has its log in place
+            _record_build(state, result.to_dict(), review)
+            warn(
+                "dependency install failed",
+                exit=code,
+                timed_out=timed_out,
+                mode=bundle_mode,
+                attempts=len(history),
+            )
             return result
+        info(
+            "dependencies installed; building with this bundle",
+            cmd=shlex.join(history[-1][0]),
+            mode=bundle_mode,
+            attempts=len(history),
+        )
 
-    argv = build_argv(site, cfg)
+    argv = build_argv(site, cfg, output)
     if not argv:
-        # no build command (an empty recipe.command): the mirrored preview tree is the artifact
-        count = dir_file_count(site.preview, site.exclude)
+        # no build command (an empty recipe.command): the mirrored tree is the artifact
+        count = dir_file_count(root, site.exclude)
         result = BuildResult(
             build_id=build_id,
             ok=True,
@@ -309,20 +541,25 @@ def run_build(site: Site, cfg: Config, state: SiteState) -> BuildResult:
             ms=int((time.monotonic() - started) * 1000),
             exit_code=0,
             command=[],
-            output_dir=str(site.output_dir),
+            output_dir=str(output),
             output_files=count,
             installed=installed,
             install_ms=install_ms,
+            tree=tree,
+            bundle_mode=bundle_mode,
         )
-        state.record_build(result.to_dict())
+        _record_build(state, result.to_dict(), review)
         return result
 
-    info("build started", build_id=build_id, cmd=shlex.join(argv))
+    info(
+        "build started", build_id=build_id, cmd=shlex.join(argv), tree=tree, bundle_mode=bundle_mode
+    )
     code, out, timed_out = _run_capture(
         argv,
-        cwd=site.preview,
+        cwd=root,
         timeout=cfg.build_timeout_s,
-        extra_env=dict(site.recipe.env),
+        extra_env=extra_env,
+        drop_env=drop_env,
     )
     clean_log = _ANSI.sub("", out)
     ms = int((time.monotonic() - started) * 1000)
@@ -330,7 +567,7 @@ def run_build(site: Site, cfg: Config, state: SiteState) -> BuildResult:
     if timed_out:
         warn("build timed out, process group killed", build_id=build_id, timeout=cfg.build_timeout_s)
 
-    output_files = dir_file_count(site.output_dir, site.exclude) if site.output_dir.is_dir() else 0
+    output_files = dir_file_count(output, site.exclude) if output.is_dir() else 0
     ok = (not timed_out) and code == 0
 
     result = BuildResult(
@@ -340,24 +577,33 @@ def run_build(site: Site, cfg: Config, state: SiteState) -> BuildResult:
         ms=ms,
         exit_code=code,
         command=argv,
-        output_dir=str(site.output_dir),
+        output_dir=str(output),
         output_files=output_files,
         installed=installed,
         install_ms=install_ms,
         timed_out=timed_out,
         errors=extract_errors(clean_log),
         log_tail=tail_lines(clean_log, cfg.log_tail_lines),
+        tree=tree,
+        bundle_mode=bundle_mode,
     )
 
-    state.record_build(result.to_dict())
-    (cfg.log_dir / f"{ARTIFACT_STEM}.log").parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(
-        cfg.log_dir / f"{ARTIFACT_STEM}.log",
-        f"# build {build_id} @ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}\n"
-        f"# cmd: {shlex.join(argv)}\n"
-        f"# exit={code} ok={ok} ms={ms} files={output_files}\n\n{clean_log}",
+    _persist_log(
+        cfg, build_id, argv, code, ok, ms, output_files, clean_log,
+        log_name=log_name, ts=ts, bundle_mode=bundle_mode,
     )
-    info("build finished", build_id=build_id, ok=ok, exit=code, ms=ms, files=output_files)
+    # the log first, the record second: a recorded build always has its log in place
+    _record_build(state, result.to_dict(), review)
+    info(
+        "build finished",
+        build_id=build_id,
+        ok=ok,
+        exit=code,
+        ms=ms,
+        files=output_files,
+        tree=tree,
+        bundle_mode=bundle_mode,
+    )
     return result
 
 

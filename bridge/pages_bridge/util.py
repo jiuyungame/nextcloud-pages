@@ -57,8 +57,50 @@ class BadRequest(BridgeError):
     http = 400
 
 
+class ConfirmRequired(BridgeError):
+    """The value names something that already exists, so the change needs an explicit confirmation.
+
+    ``exists`` (and the hint) ride both at the top level and under ``details``: the bridge's own HTTP
+    contract puts them next to ``error``, while the app reads ``details``. Nothing is changed when this
+    is raised.
+    """
+
+    code = "CONFIRM_REQUIRED"
+    http = 409
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload.update(payload.get("details") or {})
+        return payload
+
+
 class PathTraversal(BadRequest):
     code = "PATH_TRAVERSAL"
+
+
+class DigestMismatch(BadRequest):
+    """The bytes waiting for approval are not the ones the caller approved.
+
+    ``expected`` is the digest the caller sent (what it approved), ``actual`` the digest of the
+    bytes the tree holds now. They ride both at the top level (the bridge's HTTP contract) and under
+    ``details`` (the app reads that one). Nothing is written before this is raised.
+    """
+
+    code = "DIGEST_MISMATCH"
+
+    def __init__(self, expected: str, actual: str) -> None:
+        super().__init__(
+            "the candidate changed after it was requested; the bytes waiting for approval are not the ones approved",
+            expected=expected,
+            actual=actual,
+        )
+        self.expected = expected
+        self.actual = actual
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload.update(payload.get("details") or {})
+        return payload
 
 
 class MirrorDeleteGuard(BridgeError):
@@ -66,6 +108,47 @@ class MirrorDeleteGuard(BridgeError):
 
     code = "MIRROR_DELETE_GUARD"
     http = 409
+
+
+class AuthorRootMoveFailed(BridgeError):
+    """The author content directory was not changed: some content under the old name could not move.
+
+    The move is all or nothing and it runs before the configuration is adopted, so the round is
+    rolled back: the files this call already moved are put back under the old name (best effort -
+    ``rollback_failed`` names the ones that could not be) and the old root stays in force, which is
+    what lets the caller retry the same request. ``moved`` (the per-directory counts), ``failed``
+    (the targets that could not move), ``remaining`` (the old-prefix targets still there) and
+    ``rollback_failed`` (the new-prefix targets that could not be put back) ride both at the top
+    level - the bridge's HTTP contract puts them next to ``error`` - and under ``details``, which is
+    what the app reads.
+    """
+
+    code = "AUTHOR_ROOT_MOVE_FAILED"
+    http = 409
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload.update(payload.get("details") or {})
+        return payload
+
+
+class WorkDrift(BridgeError):
+    """The commit tree is not the current source/ + online/ assembly, so nothing was committed.
+
+    ``publish`` checks and commits, it never assembles: a commit tree that does not match the
+    current assembly is refused instead of rebuilt, so a publish can never sweep in (or delete) a
+    file the assembly does not carry. ``missing``/``different``/``extra``, the counts and the bounded
+    ``targets`` samples ride both at the top level (the bridge's HTTP contract) and under ``details``
+    (the app reads that one).
+    """
+
+    code = "WORK_DRIFT"
+    http = 409
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload.update(payload.get("details") or {})
+        return payload
 
 
 class GitError(BridgeError):
@@ -81,9 +164,10 @@ class Conflict(BridgeError):
 class Unpaired(BridgeError):
     """The bridge has no usable secrets yet: only ``GET /health`` and ``POST /pair`` answer.
 
-    An unpaired bridge is a normal state, not a failure: the app pushes both secrets (and the site)
-    in one ``POST /pair``. Every other route answers 503 with this code so the settings form can
-    tell "not paired yet" apart from "broken".
+    ``POST /site/reset`` is the one exception: it answers "already clean" without a secret, because a
+    second reset has no site left to drop. An unpaired bridge is a normal state, not a failure: the
+    app pushes both secrets (and the site) in one ``POST /pair``. Every other route answers 503 with
+    this code so the settings form can tell "not paired yet" apart from "broken".
     """
 
     code = "UNPAIRED"
@@ -128,7 +212,7 @@ class PairingCodeExpired(BridgeError):
         super().__init__("the pairing code expired - run bridge/install.sh again")
 
 
-_LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40}
+_LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40, "critical": 50}
 _MIN_LEVEL = _LEVELS.get(os.environ.get("PAGES_BRIDGE_LOG", "info").lower(), 20)
 
 
@@ -138,7 +222,7 @@ def log(level: str, msg: str, **fields: Any) -> None:
     record: dict[str, Any] = {"ts": round(time.time(), 3), "level": level, "msg": msg}
     if fields:
         record.update(fields)
-    stream = sys.stderr if level in ("warn", "error") else sys.stdout
+    stream = sys.stderr if level in ("warn", "error", "critical") else sys.stdout
     print(json.dumps(record, ensure_ascii=False, default=str), file=stream, flush=True)
 
 
@@ -156,6 +240,11 @@ def warn(msg: str, **f: Any) -> None:
 
 def error(msg: str, **f: Any) -> None:
     log("error", msg, **f)
+
+
+def critical(msg: str, **f: Any) -> None:
+    """A condition the bridge refuses to run with: always logged, never filtered by PAGES_BRIDGE_LOG."""
+    log("critical", msg, **f)
 
 
 def norm_abs(path: str | os.PathLike[str]) -> Path:

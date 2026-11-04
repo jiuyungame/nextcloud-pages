@@ -5,7 +5,10 @@ declare(strict_types=1);
 namespace OCA\Pages\Service;
 
 /**
- * ETag optimistic-lock conflict: the file was changed elsewhere (expected, not a bridge failure).
+ * A conflict the caller can resolve: an ETag optimistic-lock mismatch, an existing file or folder
+ * where the request asked to create, or a review state the requested transition cannot start from.
+ * Expected, and not a bridge failure: the same request may succeed after a reload or a different
+ * decision.
  */
 class ConflictException extends \RuntimeException
 {

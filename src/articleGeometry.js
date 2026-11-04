@@ -35,7 +35,7 @@ export function isArticlePath(path) {
 	return clean.split('/').filter((segment) => segment !== '').length >= 3
 }
 
-/** The `_posts/<uid>/<file>` prefix of a target, so a new file can be placed next to another one. */
+/** The directory a target lives in (`_posts` when it has none), so a new file can be placed next to it. */
 export function postsDirOf(path) {
 	const clean = String(path || '').trim().replace(/^\/+/, '')
 	const cut = clean.lastIndexOf('/')

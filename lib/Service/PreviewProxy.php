@@ -13,6 +13,15 @@ use OCP\IURLGenerator;
  */
 class PreviewProxy
 {
+    /**
+     * The build output a preview reads. `preview` is the tree the published site is built from - the
+     * default, and the only one that existed before reviewer previews. `onlinepreview` is the bridge's
+     * review tree: the published content with the frozen, not-yet-approved candidates laid over it
+     * (`GET /preview/{token}/{path}?tree=onlinepreview` on the bridge).
+     */
+    public const TREE_PREVIEW = 'preview';
+    public const TREE_ONLINEPREVIEW = 'onlinepreview';
+
     /** Only these content types are rewritten. */
     private const REWRITABLE = ['text/html', 'application/xhtml+xml', 'text/css'];
 
@@ -53,11 +62,30 @@ JS;
     }
 
     /**
+     * Fetches one file of the selected build output and rewrites it for the iframe.
+     *
+     * `$tree` chooses the bridge tree: {@see self::TREE_PREVIEW} (the published output, the default)
+     * or {@see self::TREE_ONLINEPREVIEW} (the review tree). The rewriting is the same for both - it
+     * maps the build's root-absolute URLs onto the preview base - so a candidate page is served with
+     * its own bytes and the same injected scroll/reload script. Callers are expected to have checked
+     * who may read that tree: this class makes no permission decision.
+     *
+     * The selector follows the request that named it, not what that page pulls in: a rewritten
+     * root-absolute URL carries no query, and a link followed inside the frame loses it as well, so
+     * those sub-requests are read from the published tree. The candidate page itself - the thing a
+     * reviewer decides about - is the one served from the review tree.
+     *
      * @return array{status:int, body:string, contentType:string}
      */
-    public function fetch(string $path, string $base, ?string $siteUrl = null, string $nonce = ''): array
+    public function fetch(
+        string $path,
+        string $base,
+        ?string $siteUrl = null,
+        string $nonce = '',
+        string $tree = self::TREE_PREVIEW,
+    ): array
     {
-        $result = $this->bridge->fetchPreview($path);
+        $result = $this->bridge->fetchPreview($path, $tree);
         $contentType = strtolower(trim(explode(';', $result['contentType'] ?: 'application/octet-stream')[0]));
 
         if ($result['status'] === 200 && in_array($contentType, self::REWRITABLE, true)) {

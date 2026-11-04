@@ -6,6 +6,7 @@ namespace OCA\Pages\Service;
 
 use OCP\IConfig;
 use OCP\IL10N;
+use OCP\IUserManager;
 use OCP\Security\ICrypto;
 
 /**
@@ -22,8 +23,6 @@ class SiteRegistry
     public const KEY_SHARED_SECRET = 'bridge_shared_secret';
     public const KEY_SIGNING_SECRET = 'bridge_session_signing_secret';
     public const KEY_SITE = 'site';
-    /** Legacy key of the multi-site era; read-only, kept so that installs written by it still load. */
-    public const KEY_SITES = 'sites';
     public const KEY_REVISION = 'sites_revision';
     /**
      * Global (host-wide) bridge parameters the administrator set in this app, as one JSON object.
@@ -65,8 +64,8 @@ class SiteRegistry
 
     // group grants: administrators always hold every capability, these lists only add to that.
     // Two of the three names are retired: `edit_groups` was merged into `publish_groups` (v2), and
-    // `publish_groups` was merged into `review_groups` (v3, see PermissionMigration). Only the review
-    // grant is read any more; the two retired keys exist for the one-shot migrations and the snapshot.
+    // `publish_groups` was merged into `review_groups` (v3). Only the review grant is read any more;
+    // the two retired keys grant nothing and are kept for compatibility reads alone.
     public const KEY_EDIT_GROUPS = 'edit_groups';
     public const KEY_PUBLISH_GROUPS = 'publish_groups';
     public const KEY_REVIEW_GROUPS = 'review_groups';
@@ -78,7 +77,7 @@ class SiteRegistry
      * object the bridge receives.
      */
     public const AUTHOR_AREA = 'Pages';
-    /** The retired setting of the pre-v2 layout: only the migration clears it. */
+    /** The retired setting of the pre-v2 layout: nothing reads it any more. */
     public const KEY_AUTHOR_AREA = 'author_area';
     public const DEFAULT_AUTHOR_ROOT = 'tmp';
     public const KEY_AUTHOR_ROOT = 'author_root';
@@ -88,19 +87,34 @@ class SiteRegistry
      */
     public const RESERVED_AUTHOR_ROOTS = ['_posts', '_data', '_layouts', '_includes', '_sass', 'assets', '_site', '.git'];
     public const KEY_AUTHOR_GROUPS = 'author_groups';
+
     /**
-     * What the last successful bridge push handed over, keyed by uid: `{uid: [target, ...]}`. It is
-     * the only source for "what has to be deleted from the mirror", so it is written after the bridge
-     * accepted the payload and never before.
+     * The directory that receives an article whose author deleted it, instead of losing it: the file is
+     * written into the **site source** as `<author_root>/<orphan_owner>/<rel>` and the manifest entry is
+     * forgotten, so the site owns the page from then on.
+     *
+     * It has to be a directory name that is **not a real user id**: the bridge excludes every *real*
+     * author's `<author_root>/<uid>/` prefix from the skeleton mirror, so a name that happens to be an
+     * account would make the transferred file invisible to the mirror - the exact opposite of the point.
+     */
+    public const KEY_ORPHAN_OWNER = 'orphan_owner';
+    public const DEFAULT_ORPHAN_OWNER = 'Admin';
+
+    /** Upper bound of an orphan owner name: a directory segment, not a path and not a sentence. */
+    public const ORPHAN_OWNER_MAX = 64;
+    /**
+     * The author targets an older version's last accepted push left behind, keyed by uid:
+     * `{uid: [target, ...]}`. Nothing writes it any more and the steady-state flow does not read it;
+     * the one-shot overwrite consults it only to learn directory names that may still hold stale
+     * bridge files, and the reset deletes it.
      */
     public const KEY_AUTHOR_SOURCES = 'author_sources';
 
     /**
-     * The on-site subset of the same push, keyed by uid: exactly what the bridge's **commit** tree
-     * holds. The two maps answer different questions and must not be merged: the full one computes
-     * `removed` (a file that disappeared from the author area), the on-site one tells the publish
-     * whether a path is still committed at all (a page that was only turned internal has not been
-     * deleted from Nextcloud, but it has left the commit tree).
+     * The retired on-site companion of the map above, keyed by uid. Nothing derives an on-site set
+     * any more: what the site serves is `online/`, and a publish reads that, so nothing reads this
+     * key; it is only deleted (overwrite, reset) so an install that still carries it does not keep a
+     * second, stale answer around.
      */
     public const KEY_AUTHOR_SOURCES_ONSITE = 'author_sources_onsite';
 
@@ -160,6 +174,7 @@ MD,
         private IConfig $config,
         private ICrypto $crypto,
         private IL10N $l10n,
+        private IUserManager $userManager,
     ) {
     }
 
@@ -239,6 +254,37 @@ MD,
     public const KEY_LAST_PUSH_FAILURE = 'last_push_failure';
 
     /**
+     * The push failure of the **last publish** (a commit whose push was attempted and failed).
+     *
+     * It is what marks the live rows `pushFailed`: the commit carried the entries, so they are live,
+     * and the one fact that is still wrong is that the remote did not get them. Cleared
+     * by the next publish whose push was not attempted (no remote) or went through - there is no
+     * "not pushed" state stored anywhere, only this one failure record.
+     */
+    public const KEY_PUBLISH_PUSH_FAILURE = 'publish_push_failure';
+
+    /**
+     * Whether a publish repository was ever seen to exist, as a sticky `0`/`1`.
+     *
+     * The bridge is the authority - only its working copy really knows - so every path that sees the
+     * repository (a commit, a successful init, an `initialized:true` status) marks it here. The flag
+     * is what answers when the bridge cannot be asked: a status call that fails must not turn the
+     * permanent lock on `repo_url`/`branch` into an open one. Only the full reset clears it, because
+     * only the reset deletes the repository.
+     */
+    public const KEY_REPO_INITIALISED = 'repo_initialised';
+
+    /**
+     * The pending bridge cleanup of a reset that ran while the bridge was unreachable.
+     *
+     * The app-side reset clears the normal credentials (the app is unpaired afterwards), so the
+     * retry of the bridge half needs the address and shared secret it was reset with. They live in
+     * this one record - encrypted like every other secret - and only until the bridge confirms the
+     * cleanup; `occ pages:doctor` reports the pending state.
+     */
+    public const KEY_RESET_PENDING = 'bridge_reset_pending';
+
+    /**
      * The global bridge parameters the administrator set here, exactly as stored: no defaults are
      * filled in, because an omitted key is what keeps the bridge on its own TOML/default value.
      *
@@ -293,10 +339,8 @@ MD,
     }
 
     /**
-     * Compatibility read of the retired editing grant, the first of the two merges. Editing
-     * collapsed into publishing (v2), and publishing collapsed into reviewing (v3): the migration
-     * folds this list into the review grant and clears it, so it is empty on every install that has
-     * run the migration and it grants nothing any more. Only the migration reads it; nothing may
+     * Compatibility read of the retired editing grant. Editing collapsed into publishing (v2), and
+     * publishing collapsed into reviewing (v3): this list grants nothing any more, and nothing may
      * gate on it.
      *
      * An unset or malformed value reads as "no group is granted", never as "everyone".
@@ -309,20 +353,8 @@ MD,
     }
 
     /**
-     * Compatibility setter of the retired editing grant: the capability lives in `review_groups`, so
-     * storing a list here changes no capability at all. Present so that code written before the merge
-     * keeps running instead of fataling.
-     *
-     * @param array<int,mixed> $gids
-     */
-    public function setEditGroups(array $gids): void
-    {
-        $this->setGroupList(self::KEY_EDIT_GROUPS, $gids);
-    }
-
-    /**
-     * Groups granted reviewing — which is also the publishing grant ({@see PermissionMigration}):
-     * approving or rejecting visibility requests, taking an article off the site directly, moderating
+     * Groups granted reviewing — which is also the publishing grant: approving or rejecting
+     * visibility requests, taking an article off the site directly, moderating
      * comments, and publishing (building, diffing, pushing, the site's own files and reaching other
      * authors' areas). Administrators do not need to be listed.
      *
@@ -345,43 +377,14 @@ MD,
     }
 
     /**
-     * Adds groups to the review-and-publish grant and returns what is stored afterwards: the old
-     * review members first (their order is what the settings form shows), then the newcomers that
-     * were not already there. Only the one-shot migration uses this, to fold the retired publishing
-     * grant into the review grant without losing a member.
-     *
-     * @param array<int,mixed> $gids groups to add
-     * @return list<string> the stored list, as the next read returns it
-     */
-    public function mergeReviewGroups(array $gids): array
-    {
-        $this->setGroupList(self::KEY_REVIEW_GROUPS, array_merge($this->getReviewGroups(), $gids));
-
-        return $this->getReviewGroups();
-    }
-
-    /**
      * Compatibility read of the retired publishing grant. Publishing is the review grant now
-     * ({@see getReviewGroups()}): the one-shot migration merged this list into it and cleared it, so
-     * the value is empty on every install that has run the migration. Only the migration may read it
-     * before that; nothing may gate on it.
+     * ({@see getReviewGroups()}): this list grants nothing, and nothing may gate on it.
      *
      * @return list<string>
      */
     public function getPublishGroups(): array
     {
         return $this->getGroupList(self::KEY_PUBLISH_GROUPS);
-    }
-
-    /**
-     * Compatibility setter of the retired publishing grant: the capability lives in `review_groups`,
-     * so storing a list here changes no capability at all. Only the migration writes it (to clear it).
-     *
-     * @param array<int,mixed> $gids
-     */
-    public function setPublishGroups(array $gids): void
-    {
-        $this->setGroupList(self::KEY_PUBLISH_GROUPS, $gids);
     }
 
     /**
@@ -441,10 +444,62 @@ MD,
         return $root;
     }
 
-    /** Clears the retired author-area setting; the migration calls this once. */
-    public function clearAuthorArea(): void
+    /**
+     * The site directory that receives an article whose author deleted it, default `Admin`.
+     *
+     * The stored value is shape-checked here and a value that cannot be one folder name reads as the
+     * default: a hand-edited config must not turn the transfer into a path with a slash (or into the
+     * site root). Whether the name is free - not a real user - is checked where it is *used*
+     * ({@see setOrphanOwner()} for the form, and the transfer itself for the moment of the move),
+     * because an account created after the setting was saved must not make the stored value look
+     * invalid for every reader.
+     */
+    public function getOrphanOwner(): string
     {
-        $this->config->deleteAppValue('pages', self::KEY_AUTHOR_AREA);
+        $raw = (string)$this->config->getAppValue('pages', self::KEY_ORPHAN_OWNER, self::DEFAULT_ORPHAN_OWNER);
+        try {
+            return $this->cleanOrphanOwner($raw);
+        } catch (\InvalidArgumentException) {
+            return self::DEFAULT_ORPHAN_OWNER;
+        }
+    }
+
+    /**
+     * Stores the orphan owner. The value decides where an author's deleted article lands in the site,
+     * so it is validated instead of sanitised, and it must not name an existing account: the mirror
+     * excludes real users' author directories, so the transferred file would never reach the site.
+     *
+     * @throws \InvalidArgumentException when the value is not one usable folder name, or names a user
+     */
+    public function setOrphanOwner(string $owner): void
+    {
+        $clean = $this->cleanOrphanOwner($owner);
+        if ($this->userManager->userExists($clean)) {
+            throw new \InvalidArgumentException($this->l10n->t(
+                'The orphan owner must not be an existing user: its files would be excluded from the site source.',
+            ));
+        }
+        $this->config->setAppValue('pages', self::KEY_ORPHAN_OWNER, $clean);
+    }
+
+    /**
+     * One clean orphan owner, or an `\InvalidArgumentException` naming the rule that failed. The shape
+     * is the author root's (one path segment, starting with a letter or a digit), because the value
+     * becomes one directory inside the site source.
+     *
+     * @throws \InvalidArgumentException
+     */
+    private function cleanOrphanOwner(string $owner): string
+    {
+        $owner = trim($owner);
+        if ($owner === '' || strlen($owner) > self::ORPHAN_OWNER_MAX
+            || preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]*$/', $owner) !== 1) {
+            throw new \InvalidArgumentException($this->l10n->t(
+                'The orphan owner must be a single folder name (letters, digits, dot, underscore, hyphen; no slash).',
+            ));
+        }
+
+        return $owner;
     }
 
     /**
@@ -470,9 +525,9 @@ MD,
     }
 
     /**
-     * The author targets the last accepted push handed to the bridge, keyed by uid. A value that is
-     * not a list of strings reads as "nothing was ever pushed", which is the safe direction: the
-     * removal list is then empty and the mirror keeps what it has.
+     * The author targets an older version's last accepted push left behind (legacy cache; the author
+     * content flow no longer uses it - kept only so the one-shot overwrite can read the directory
+     * names it may have to purge).
      *
      * @return array<string,list<string>>
      */
@@ -482,23 +537,9 @@ MD,
     }
 
     /**
-     * The on-site subset of the last accepted push: what the bridge's commit tree holds. An install
-     * that never pushed since this key existed falls back to the full list, which is exactly what
-     * the commit tree held before the split - a safe, if slightly stale, answer for one publish.
-     *
-     * @return array<string,list<string>>
-     */
-    public function getAuthorSourcesOnSite(): array
-    {
-        $stored = $this->decodeTargetMap(self::KEY_AUTHOR_SOURCES_ONSITE);
-
-        return $stored === [] ? $this->getAuthorSources() : $stored;
-    }
-
-    /**
-     * Stores both target maps of one accepted push. The on-site map may be omitted by a caller that
-     * only knows the full list (the legacy push path): the previously stored one is then kept, so a
-     * publish in between never mistakes "unknown" for "nothing on the site".
+     * Legacy writer of the two target maps above. The current author content flow never calls it -
+     * saves travel as deltas and the complete state as the one-shot overwrite - but the keys are still
+     * part of an older install's stored state, so this stays the one place their JSON shape is written.
      *
      * @param array<string,list<string>> $sources
      * @param array<string,list<string>>|null $onsite
@@ -610,6 +651,97 @@ MD,
         }
     }
 
+    /**
+     * Drop every setting a full reset must not keep.
+     *
+     * What survives is the bridge URL and the pushed global parameters: the first is the only
+     * setting the reset deliberately keeps (the bridge lives at the same address), and the second
+     * describes host paths, not content - clearing them would leave the bridge unable to find the
+     * Nextcloud data directory it was paired with. Everything that names content or grants access
+     * goes back to the documented defaults: no site, no author sources, `tmp` as the author content
+     * directory, `Admin` as the orphan owner, every signed-in user may author, only administrators
+     * review and publish, and no secret at all (which is the UNPAIRED state). The initialised flag
+     * goes with them as well: the repository it remembered is exactly what the reset deletes, so this
+     * is the only place allowed to clear it.
+     */
+    public function resetConfiguration(): void
+    {
+        foreach ([
+            self::KEY_SITE,
+            self::KEY_REVISION,
+            'sites_pushed_revision',
+            self::KEY_AUTHOR_AREA,
+            self::KEY_AUTHOR_ROOT,
+            self::KEY_ORPHAN_OWNER,
+            self::KEY_AUTHOR_GROUPS,
+            self::KEY_AUTHOR_SOURCES,
+            self::KEY_AUTHOR_SOURCES_ONSITE,
+            self::KEY_REVIEW_GROUPS,
+            self::KEY_PUBLISH_GROUPS,
+            self::KEY_EDIT_GROUPS,
+            self::KEY_LAST_PUSH_FAILURE,
+            self::KEY_PUBLISH_PUSH_FAILURE,
+            self::KEY_REPO_INITIALISED,
+        ] as $key) {
+            $this->config->deleteAppValue('pages', $key);
+        }
+        $this->setSharedSecret('');
+        $this->setSigningSecret('');
+    }
+
+    /**
+     * Remember what a retry of the bridge cleanup needs: its address and the secret it accepted.
+     *
+     * @param string $url          the bridge the reset should clean up
+     * @param string $sharedSecret the secret that was valid at that moment ('' when there was none)
+     */
+    public function setResetPending(string $url, string $sharedSecret): void
+    {
+        $this->config->setAppValue('pages', self::KEY_RESET_PENDING, json_encode([
+            'at' => time(),
+            'url' => $url,
+            'shared_secret' => $sharedSecret === '' ? '' : $this->crypto->encrypt($sharedSecret),
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    }
+
+    /**
+     * The pending bridge cleanup, or null when the bridge confirmed it (or no reset ran).
+     *
+     * @return array{at:int,url:string,secret:string}|null
+     */
+    public function getResetPending(): ?array
+    {
+        $raw = (string)$this->config->getAppValue('pages', self::KEY_RESET_PENDING, '');
+        if ($raw === '') {
+            return null;
+        }
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded) || array_is_list($decoded)) {
+            return null;
+        }
+        $secret = (string)($decoded['shared_secret'] ?? '');
+        if ($secret !== '') {
+            try {
+                $secret = $this->crypto->decrypt($secret);
+            } catch (\Throwable) {
+                // a rotated instance secret: the stored value is the plaintext fallback, exactly
+                // like getSecret() reads it
+            }
+        }
+
+        return [
+            'at' => (int)($decoded['at'] ?? 0),
+            'url' => (string)($decoded['url'] ?? ''),
+            'secret' => $secret,
+        ];
+    }
+
+    /** Clear the pending bridge cleanup (the bridge confirmed it). */
+    public function clearResetPending(): void
+    {
+        $this->config->deleteAppValue('pages', self::KEY_RESET_PENDING);
+    }
+
     private function setSecret(string $key, string $plain): void
     {
         if (!in_array($key, self::SECRET_KEYS, true)) {
@@ -675,32 +807,24 @@ MD,
     /**
      * The one site of this instance, or null while it has not been configured yet.
      *
-     * Both storage shapes are read: KEY_SITE holds a single JSON object, while the legacy KEY_SITES
-     * held a list of which this app only ever used the first entry.
+     * The site is one JSON object under KEY_SITE; a list or any other shape is a hand-edited value and
+     * is not a site.
      *
      * @return array<string,mixed>|null
      */
     public function getSite(): ?array
     {
         $raw = (string)$this->config->getAppValue('pages', self::KEY_SITE, '');
-        if ($raw !== '') {
-            $decoded = json_decode($raw, true);
-            // a list here would be a hand-edited value: the single site is always a JSON object
-            if (is_array($decoded) && $decoded !== [] && !array_is_list($decoded)) {
-                return $this->fillDefaults($this->dropRemovedFields($decoded));
-            }
+        if ($raw === '') {
+            return null;
+        }
+        $decoded = json_decode($raw, true);
+        // a list here would be a hand-edited value: the single site is always a JSON object
+        if (!is_array($decoded) || $decoded === [] || array_is_list($decoded)) {
+            return null;
         }
 
-        $legacy = (string)$this->config->getAppValue('pages', self::KEY_SITES, '');
-        if ($legacy === '') {
-            return null;
-        }
-        $decoded = json_decode($legacy, true);
-        if (!is_array($decoded)) {
-            return null;
-        }
-        $first = array_values($decoded)[0] ?? null;
-        return is_array($first) ? $this->fillDefaults($this->dropRemovedFields($first)) : null;
+        return $this->fillDefaults($this->dropRemovedFields($decoded));
     }
 
     /**
@@ -780,25 +904,32 @@ MD,
         return $site;
     }
 
-    /**
-     * Historical name of setSite(): the bridge push path and existing callers use it, and with a
-     * single site "put" and "set" are the same operation.
-     *
-     * @param array<string,mixed> $site
-     * @return array<string,mixed>
-     */
-    public function putSite(array $site): array
-    {
-        return $this->setSite($site);
-    }
-
     /** @param array<string,mixed> $site */
     private function persist(array $site): void
     {
         $this->config->setAppValue('pages', self::KEY_SITE, json_encode($site, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-        // the legacy KEY_SITES value is deliberately left untouched: a rollback to the previous app
-        // version then still finds a usable configuration instead of an empty one
         $this->config->setAppValue('pages', self::KEY_REVISION, (string)$this->nextRevision());
+    }
+
+    /**
+     * Drop the one site. Only the rollback of a write-through that never reached the bridge uses it:
+     * a first configuration that the backend refused must leave "no site" behind, not an empty one.
+     */
+    public function forgetSite(): void
+    {
+        $this->config->deleteAppValue('pages', self::KEY_SITE);
+    }
+
+    /**
+     * Put the revision marker back after a write-through was rolled back.
+     *
+     * The store bumps the revision when it stores a site, so a rejected push would otherwise leave the
+     * counter ahead of what the bridge holds - the next doctor run would report "out of sync" for a
+     * configuration that never changed.
+     */
+    public function restoreRevision(int $revision): void
+    {
+        $this->config->setAppValue('pages', self::KEY_REVISION, (string)$revision);
     }
 
     public function getRevision(): int
@@ -825,6 +956,30 @@ MD,
     public function hasUnpushedChanges(): bool
     {
         return $this->getRevision() > $this->getPushedRevision();
+    }
+
+    /**
+     * The sticky answer to "does the publish repository exist", for when the bridge cannot be asked.
+     *
+     * Only `'1'` is a yes: an unset value (fresh install), a hand-edited one or a leftover from a
+     * version that spelled it differently must never lock the two fields on their own.
+     */
+    public function isRepoInitialised(): bool
+    {
+        return $this->config->getAppValue('pages', self::KEY_REPO_INITIALISED, '0') === '1';
+    }
+
+    /**
+     * Remembers that the repository exists, so the remote/branch lock survives an unreachable bridge.
+     *
+     * Idempotent on purpose: the steady state is one appconfig write, ever - every save and every
+     * status call goes through here, and none of them may rewrite the value.
+     */
+    public function markRepoInitialised(): void
+    {
+        if (!$this->isRepoInitialised()) {
+            $this->config->setAppValue('pages', self::KEY_REPO_INITIALISED, '1');
+        }
     }
 
     /**
@@ -880,6 +1035,52 @@ MD,
     }
 
     /**
+     * Record (or clear, with `null`) the push failure of the last publish.
+     *
+     * @param array{code:string,ahead:int|null,commit:string,message:string}|null $failure
+     */
+    public function recordPublishPushFailure(?array $failure): void
+    {
+        if ($failure === null) {
+            $this->config->deleteAppValue('pages', self::KEY_PUBLISH_PUSH_FAILURE);
+
+            return;
+        }
+        $this->config->setAppValue('pages', self::KEY_PUBLISH_PUSH_FAILURE, json_encode([
+            'ts' => time(),
+            'code' => (string)($failure['code'] ?? 'PUSH_FAILED'),
+            'ahead' => $failure['ahead'] === null ? null : (int)$failure['ahead'],
+            'commit' => (string)($failure['commit'] ?? ''),
+            'message' => (string)($failure['message'] ?? ''),
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    }
+
+    /**
+     * The record above, or null when the last publish was not a failed push.
+     *
+     * @return array{ts:int,code:string,ahead:int|null,commit:string,message:string}|null
+     */
+    public function getPublishPushFailure(): ?array
+    {
+        $raw = (string)$this->config->getAppValue('pages', self::KEY_PUBLISH_PUSH_FAILURE, '');
+        if ($raw === '') {
+            return null;
+        }
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded) || array_is_list($decoded)) {
+            return null;
+        }
+
+        return [
+            'ts' => (int)($decoded['ts'] ?? 0),
+            'code' => (string)($decoded['code'] ?? 'PUSH_FAILED'),
+            'ahead' => isset($decoded['ahead']) ? (int)$decoded['ahead'] : null,
+            'commit' => (string)($decoded['commit'] ?? ''),
+            'message' => (string)($decoded['message'] ?? ''),
+        ];
+    }
+
+    /**
      * Fills in defaults and validates locally; the authoritative safety checks (source and working
      * copy must not contain each other, working copy must not sit in the data directory) run on the
      * bridge with the same rules. The working copy is a global bridge setting now, not a site field,
@@ -894,10 +1095,9 @@ MD,
         if ($ncPath === '' || $ncPath[0] !== '/') {
             throw new \InvalidArgumentException($this->l10n->t('nc_path must start with / (it is relative to the Nextcloud user root)'));
         }
+        // The remote is optional: a publish is the commit itself, so a site without a remote is a
+        // supported configuration ("commit only"). An empty value is a stored value, not "unchanged".
         $repoUrl = trim((string)($site['repo_url'] ?? ''));
-        if ($repoUrl === '') {
-            throw new \InvalidArgumentException($this->l10n->t('A git remote URL is required'));
-        }
 
         $recipe = is_array($site['recipe'] ?? null) ? $site['recipe'] : [];
         // Jekyll is the only generator this app drives: an install that still stores "auto" (or

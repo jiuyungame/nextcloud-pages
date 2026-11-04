@@ -1,4 +1,4 @@
-"""Mirror engine: one-way sync from the Nextcloud source dir to the working copy."""
+"""Mirror engine: one-way sync from the Nextcloud source into the commit and preview trees."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from .config import AUTHOR_ASSET_DIR, AUTHOR_POST_PREFIX, AUTHOR_ROOT_DEFAULT, AuthorEntry, AuthorSource
+from .config import AUTHOR_ROOT_DEFAULT, AuthorEntry, AuthorSource
 from .util import MirrorDeleteGuard, human_bytes, info, safe_join, sha256_file, warn
 
 
@@ -77,6 +77,11 @@ class MirrorResult:
     #: reports itself in the same shape, nested here, so the top-level counters keep meaning "the
     #: commit tree" - what a publish sees.
     preview: "MirrorResult | None" = None
+    #: The preflight's structured refusal (``error``/``message``/``tree``/``old``/``new``) when the
+    #: round was refused before it cleared anything. Deliberately **not** part of :meth:`to_dict`:
+    #: the answer shape of a round is frozen, and only a caller that must report *why* it was refused
+    #: (init) reads this field; the serialised answer keeps ``guard_tripped``/``guard_message``.
+    refusal: dict | None = None
 
     def to_dict(self) -> dict:
         out = {
@@ -190,6 +195,7 @@ def plan(
     excl: Exclusion,
     verify: str = "size+mtime",
 ) -> MirrorPlan:
+    """Compare the two trees and return what to copy, retime and delete; nothing is written yet."""
     # excluded entries are invisible on both sides, so .git and build output are never deleted
     src = scan(src_root, excl)
     dst = scan(dst_root, excl)
@@ -476,23 +482,12 @@ def _same_content(src: Path, dst: Path, verify: str) -> bool:
 def author_footprint(work_root: Path, uid: str, author_root: str = AUTHOR_ROOT_DEFAULT) -> int:
     """How many files one author has in the work copy: the denominator of that author's guard.
 
-    Every area an author may write into is counted, the current ``<author_root>/<uid>`` tree and the
-    legacy post/stylesheet ones: a guard that looked only at the legacy areas would size the budget
-    of a migrated author at zero and refuse every one of their removals.
+    The only area an author may write into is the current ``<author_root>/<uid>`` tree.
     """
-    roots = [
-        work_root / author_root / uid,
-        work_root / AUTHOR_POST_PREFIX / uid,
-        work_root / AUTHOR_ASSET_DIR / f"{uid}.css",
-        work_root / AUTHOR_ASSET_DIR / uid,
-    ]
-    total = 0
-    for base in roots:
-        if base.is_dir():
-            total += sum(1 for path in base.rglob("*") if path.is_file())
-        elif base.is_file():
-            total += 1
-    return total
+    base = work_root / author_root / uid
+    if not base.is_dir():
+        return 0
+    return sum(1 for path in base.rglob("*") if path.is_file())
 
 
 def plan_author(
@@ -708,10 +703,9 @@ def sync_author(
             dst.unlink()
             result.deleted += 1
             result.removed.append(target)
-            # the post directory of an author stays while it holds posts; the shared assets/authors
-            # directory is never removed, so the next author's stylesheet finds it again
-            keep = 3 if Path(target).parts[:2] == ("assets", "authors") else 2
-            _prune_empty_parents(work_root, dst, keep)
+            # the author's own directory stays while it holds files; the shared author root is
+            # never removed, so the next round finds it again
+            _prune_empty_parents(work_root, dst, 2)
         except OSError as exc:
             warn("delete failed, skipping", uid=author.uid, target=target, error=str(exc))
 

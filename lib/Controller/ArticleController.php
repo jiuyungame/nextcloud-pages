@@ -7,6 +7,7 @@ namespace OCA\Pages\Controller;
 use OCA\Pages\AppInfo\Application;
 use OCA\Pages\Db\Article;
 use OCA\Pages\Service\ArticleIndexService;
+use OCA\Pages\Service\ArticleReviewService;
 use OCA\Pages\Service\BridgeClient;
 use OCA\Pages\Service\EngagementService;
 use OCA\Pages\Service\FileService;
@@ -38,16 +39,22 @@ class ArticleController extends BaseController
         IL10N $l10n,
         private ArticleIndexService $articleIndex,
         private EngagementService $community,
+        private ArticleReviewService $review,
     ) {
         parent::__construct(Application::APP_ID, $request, $userSession, $groupManager, $registry, $files, $bridge, $l10n);
     }
 
     /**
-     * The article list: every page of the site, optionally filtered by tag, by visibility state and by
-     * "approved for the site only" (`?external=true`), and sorted.
+     * The article list: every page of the site, optionally filtered by tag, by visibility state, by
+     * "nothing is pending on it" (`?external=true`, i.e. the `external` state) and by "a frozen
+     * candidate waits for a decision" (`?awaiting=true`), and sorted.
      *
      * A filter is answered here rather than in the browser: the list can be truncated, and filtering a
      * truncated list in the client would quietly show "nothing matches" for rows that were never sent.
+     *
+     * `awaiting` wins over `state` when both are sent: it is the narrower question (an entry with a
+     * candidate is `requested`, and an online page with a candidate keeps its old version on the site)
+     * and the two filters together would answer a third one.
      */
     #[NoAdminRequired]
     public function index(): DataResponse
@@ -57,15 +64,21 @@ class ArticleController extends BaseController
             return $denied;
         }
         try {
+            $awaiting = $this->awaitingParam();
             $result = $this->articleIndex->listed(
                 $this->currentUserId(),
                 $this->tagParam(),
                 $this->sortParam(),
-                $this->stateParam(),
+                $awaiting ? '' : $this->stateParam(),
                 $this->externalParam(),
+                $awaiting,
             );
 
-            return new DataResponse($result);
+            // The review counts ride along: the requests panel shows how many pages are approved for
+            // the site, and querying the article table again for that one number would be a second
+            // read of data the same page is about to show anyway. A read failure answers zeroes,
+            // which is the counts() contract; it never turns the list into an error.
+            return new DataResponse([...$result, 'counts' => $this->review->counts()]);
         } catch (\Throwable $e) {
             return $this->translate($e) ?? throw $e;
         }
@@ -92,6 +105,17 @@ class ArticleController extends BaseController
     private function externalParam(): bool
     {
         return filter_var($this->request->getParam('external', false), FILTER_VALIDATE_BOOLEAN) === true;
+    }
+
+    /**
+     * `?awaiting=true` (or `1`): only the entries with a frozen candidate waiting for a decision - the
+     * requests the panel lists. The bytes were frozen when the author asked, so the reviewer decides
+     * about exactly that content; an entry whose author is still editing has no candidate and is not
+     * one.
+     */
+    private function awaitingParam(): bool
+    {
+        return filter_var($this->request->getParam('awaiting', false), FILTER_VALIDATE_BOOLEAN) === true;
     }
 
     /**
@@ -150,7 +174,9 @@ class ArticleController extends BaseController
     }
 
     /**
-     * Tags of the published articles, most used first: the sidebar of the reading view.
+     * Tags of every article in the reading list, most used first: the sidebar of the reading view.
+     * Internal pages are included, because the list shows them and the filter must not hide their
+     * tags.
      */
     #[NoAdminRequired]
     public function tags(): DataResponse
@@ -169,7 +195,7 @@ class ArticleController extends BaseController
     /**
      * Rates an article, or withdraws the caller's vote.
      *
-     *   {"path": "/_posts/alice/x.md", "vote": "up"|"down"|"none"}
+     *   {"path": "/<author_root>/<uid>/x.md", "vote": "up"|"down"|"none"}
      *
      * One row per voter and article: a changed vote updates it, `none` deletes it. The answer carries
      * the article's new counters and the caller's own vote, so the reading view updates in place.
@@ -200,7 +226,7 @@ class ArticleController extends BaseController
     }
 
     /**
-     * The comment thread of one article, oldest first: `?path=/_posts/alice/x.md`.
+     * The comment thread of one article, oldest first: `?path=/<author_root>/<uid>/x.md`.
      *
      * A comment that was deleted is left out for readers and included with `deleted: true` for a caller
      * with the review grant, who is the one who moderated it.
@@ -226,7 +252,7 @@ class ArticleController extends BaseController
     }
 
     /**
-     * Writes a comment: `{"path": "/_posts/alice/x.md", "body": "…"}`.
+     * Writes a comment: `{"path": "/<author_root>/<uid>/x.md", "body": "…"}`.
      *
      * The body is plain text - what the caller typed, trimmed, nothing else - and is handed back the
      * same way: the browser renders it as text, never as markup. The rate limit (see

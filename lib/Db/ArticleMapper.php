@@ -99,6 +99,11 @@ class ArticleMapper extends QBMapper
      * An existing article only has its editable fields refreshed: `state`, `created_at`,
      * `submitted_at`, `published_at` and `published_revision` belong to the visibility workflow and
      * are never written here.
+     *
+     * A row that already carries the title, the tags and the owner passed in is returned untouched:
+     * the caller parses the file on every pass and hands over the same values on most of them, and an
+     * update that changes nothing would still move `updated_at` (which the read path used to compare
+     * against the file's mtime) without saying anything new.
      */
     public function upsertByPath(string $path, string $ownerUid, string $title, string $tags): Article
     {
@@ -128,6 +133,14 @@ class ArticleMapper extends QBMapper
                 ?? throw new \RuntimeException('The article row disappeared while it was being inserted: ' . $path);
         }
 
+        // The update below writes title/tags unconditionally and adopts the caller when the row is
+        // unowned. When neither would change anything there is nothing to write: returning the row is
+        // the whole update, minus the timestamp churn.
+        $ownerSettled = $existing->getOwnerUid() !== '' || $ownerUid === '';
+        if ($existing->getTitle() === $title && $existing->getTags() === $tags && $ownerSettled) {
+            return $existing;
+        }
+
         $qb = $this->db->getQueryBuilder();
         $qb->update($this->getTableName())
             ->set('title', $qb->createNamedParameter($title, IQueryBuilder::PARAM_STR))
@@ -147,7 +160,7 @@ class ArticleMapper extends QBMapper
     }
 
     /**
-     * Moves an article through the review workflow.
+     * Writes the review columns of one article - the cache update the visibility manifest drives.
      *
      * `state` and `review_note` are always written (`$note = ''` clears the note). The trailing
      * timestamps are only written when they carry a value, so publishing an article keeps the moment
@@ -193,6 +206,22 @@ class ArticleMapper extends QBMapper
         $qb->delete($this->getTableName())
             ->where($qb->expr()->eq('id', $qb->createNamedParameter($id, IQueryBuilder::PARAM_INT)));
         $qb->executeStatement();
+    }
+
+    /**
+     * Every row, gone: the full reset starts from an empty cache table again.
+     *
+     * The table is only a cache of the visibility manifest, so emptying it alongside the manifest is
+     * one operation; a failure here leaves rows the next reset removes again.
+     *
+     * @return int rows deleted
+     */
+    public function deleteAll(): int
+    {
+        $qb = $this->db->getQueryBuilder();
+        $qb->delete($this->getTableName());
+
+        return $qb->executeStatement();
     }
 
     public function countAll(): int

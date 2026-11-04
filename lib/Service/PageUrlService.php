@@ -26,6 +26,10 @@ use OCP\Files\NotPermittedException;
  *
  * Everything here is read-only: `_config.yml` is the site owner's file and this class only reads the
  * `authors:` block out of it. The single exception to "read only" is nothing at all - no method writes.
+ *
+ * The site folder holds three fixed subdirectories and the skeleton lives in `source/`
+ * ({@see SiteTrees}), so every path this class asks the Files API for is resolved under it - the
+ * callers pass the site folder, never one of the three names.
  */
 final class PageUrlService
 {
@@ -72,7 +76,7 @@ final class PageUrlService
             return $this->blocks[$key];
         }
         try {
-            $raw = (string)($this->files->read($userId, $ncPath, self::CONFIG_FILE)['content'] ?? '');
+            $raw = (string)($this->files->read($userId, self::sourceRoot($ncPath), self::CONFIG_FILE)['content'] ?? '');
         } catch (NotFoundException|NotPermittedException) {
             // no configuration, or one the Files API will not hand out as text: there is no block to
             // read, which is a fact the caller may want to report
@@ -269,7 +273,7 @@ final class PageUrlService
         $found = false;
         foreach (self::CATEGORY_EXTENSIONS as $extension) {
             try {
-                if ($this->files->fileExists($userId, $ncPath, $category . '.' . $extension)) {
+                if ($this->files->fileExists($userId, self::sourceRoot($ncPath), $category . '.' . $extension)) {
                     $found = true;
                     break;
                 }
@@ -280,6 +284,15 @@ final class PageUrlService
         }
 
         return $this->categoryPages[$key] = $found;
+    }
+
+    /**
+     * The skeleton directory of a site folder: `<nc_path>/source`. The three names are derived by the
+     * app from `nc_path` ({@see SiteTrees}), which is the one path the configuration stores.
+     */
+    private static function sourceRoot(string $ncPath): string
+    {
+        return rtrim(trim($ncPath), '/') . '/' . SiteTrees::SOURCE;
     }
 
     /**

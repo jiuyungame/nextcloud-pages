@@ -19,9 +19,10 @@ use OCP\Server;
  * this class is the only place that knows how a target corresponds to a file, and the only place
  * that has to ask "may this caller touch it".
  *
- * Ownership rule: a caller is either the author of the area (`$uid`) or an editor, publisher or
- * administrator, who may touch every area and the site skeleton. A target that names another author
- * is refused here rather than at the call site, so no endpoint can address a foreign file by accident.
+ * Ownership rule: a caller is either the author of the area (`$uid`) or a holder of the review grant
+ * (which also carries publishing) or an administrator, who may touch every area and the site
+ * skeleton. A target that names another author is refused here rather than at the call site, so no
+ * endpoint can address a foreign file by accident.
  *
  * The class is otherwise side-effect free: it maps paths and reads metadata, it never writes a file.
  * The one exception is deliberate and named as such: `ensureArea()` creates the area folder.
@@ -33,13 +34,6 @@ final class AuthorAreaService
 
     /** The extensions Jekyll renders as documents: those entries get the article editor and community. */
     public const RENDERABLE_EXTENSIONS = ['md', 'markdown', 'html'];
-
-    /**
-     * The retired target prefix of the pre-v2 layout (`_posts/<uid>/…`). Files have been moved and
-     * manifest keys rewritten, but a stale target list, a hand-edited manifest or a not-yet-pushed
-     * client may still name one: it is still resolved, only never produced.
-     */
-    public const LEGACY_PREFIX = '_posts';
 
     private IUserManager $userManager;
 
@@ -94,12 +88,6 @@ final class AuthorAreaService
         return $this->authorRoot() . '/' . $uid;
     }
 
-    /** The retired prefix of the same author; used by the migration and by stale target lists. */
-    public function legacyPrefix(string $uid): string
-    {
-        return self::LEGACY_PREFIX . '/' . $uid;
-    }
-
     /**
      * The site target of one file inside an author area: the whole tree lands under
      * `<author_root>/<uid>/`, at the depth it has in the author's own folder. Every file is an entry
@@ -113,9 +101,7 @@ final class AuthorAreaService
     }
 
     /**
-     * A target expressed inside the author's own area, or '' when it does not belong to it. The
-     * retired `_posts/<uid>/` prefix is accepted too: a manifest written before the migration, or a
-     * client that has not reloaded, must still find its file.
+     * A target expressed inside the author's own area, or '' when it does not belong to it.
      */
     public function areaRelative(string $uid, string $target): string
     {
@@ -123,13 +109,12 @@ final class AuthorAreaService
         if ($target === '') {
             return '';
         }
-        foreach ([$this->targetPrefix($uid), $this->legacyPrefix($uid)] as $prefix) {
-            if (str_starts_with($target, $prefix . '/')) {
-                return substr($target, strlen($prefix) + 1);
-            }
+        $prefix = $this->targetPrefix($uid);
+        if (!str_starts_with($target, $prefix . '/')) {
+            return '';
         }
 
-        return '';
+        return substr($target, strlen($prefix) + 1);
     }
 
     /**
@@ -138,7 +123,7 @@ final class AuthorAreaService
      * `$uid` is the author whose area may be addressed; `$selfOnly` restricts the caller to that one
      * area (a user without the edit capability), while an editor passes false and may address any
      * author's target. Two shapes are accepted:
-     *   - a site target: `<author_root>/<uid>/<file>` (or the retired `_posts/<uid>/<file>`)
+     *   - a site target: `<author_root>/<uid>/<file>`
      *   - a path relative to the area itself: `2026-05-01-hello.md`, `images/pic.png`, `drafts/note.md`
      * A single leading slash is tolerated on both (article paths travel with one through the JSON API),
      * but a doubled one is not: `//x` is an absolute-path attempt, and nothing here needs it.
@@ -199,26 +184,14 @@ final class AuthorAreaService
     public function uidOfTarget(string $target): ?string
     {
         $target = $this->normalizeRelative($target);
-        foreach ([$this->authorRoot(), self::LEGACY_PREFIX] as $root) {
-            $prefix = $root . '/';
-            if (!str_starts_with($target, $prefix)) {
-                continue;
-            }
-            $rest = substr($target, strlen($prefix));
-            $uid = strstr($rest, '/', true);
-
-            return $uid === false || $uid === '' ? null : $uid;
+        $prefix = rtrim($this->authorRoot(), '/') . '/';
+        if (!str_starts_with($target, $prefix)) {
+            return null;
         }
+        $rest = substr($target, strlen($prefix));
+        $uid = strstr($rest, '/', true);
 
-        return null;
-    }
-
-    /** Whether a target is expressed in the retired `_posts/<uid>/…` namespace. */
-    public function isLegacyTarget(string $target): bool
-    {
-        $target = $this->normalizeRelative($target);
-
-        return str_starts_with($target, self::LEGACY_PREFIX . '/');
+        return $uid === false || $uid === '' ? null : $uid;
     }
 
     /**

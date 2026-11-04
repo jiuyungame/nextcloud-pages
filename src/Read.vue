@@ -1,20 +1,81 @@
 <!--
 	Read: every page of the site, as a reader sees it. Open to every signed-in user — reading needs no
-	capability — so this view is never gated on a grant, and it filters nothing by visibility: each row
-	says which of the three states it is in (内部 / 待审核 / 外部), and votes and comments stay available
-	on every entry.
+	capability — so this view is never gated on a grant, and it hides nothing: each row says which of
+	the three states it is in (内部 / 待审核 / 外部), and votes and comments stay available on every
+	entry. The state row only narrows the list when the reader asks for it.
 
-	Two steps in one view: the list (with a tag filter and a sort switch, both of which re-request from
-	the server rather than sorting a local copy), and the article itself — its own built page in the
-	existing preview iframe, the vote widget and the comment thread. The iframe is fed by the preview
-	token the app already holds, so a reader who never opened the site preview still gets one: the
-	parent fetches it when this view is entered (App.vue's `view` watcher), and that is the one place
-	that asks — fetching here as well would ask twice on a direct visit.
+	Three panes in one view, only one of them at a time: the site preview (the whole built site,
+	index page first, with the address the frame is showing above it), the list (with a tag filter, a
+	state filter and a sort switch, all of which re-request from the server rather than filtering a
+	local copy), and one article — its own built page in the same preview iframe, the vote widget and
+	the comment thread. The iframes are fed by the preview token the app already holds, so a reader
+	who never opened the article preview still gets one: the parent fetches it when this view is
+	entered (App.vue's `view` watcher), and that is the one place that asks — fetching here as well
+	would ask twice on a direct visit.
 -->
 <template>
 	<div class="pages-read">
-		<!-- ---------------------------------------------------------------- one article -->
-		<template v-if="selected">
+		<!-- ---------------------------------------------------------------- the site preview -->
+		<div v-if="sitePreview" class="pages-read__site">
+			<div class="pages-read__site-head">
+				<!--
+					The address is an input, not a label: a site has more pages than the links in it
+					lead to, and a reader who knows where they are going should not have to hunt for a
+					link first. Only site-relative paths are accepted (no full URLs), because the frame
+					is served through this app's own preview mount.
+
+					The field shows — and the reader edits — the readable form of the path (`中文.html`),
+					never the percent-encoded form the URL needs (`%E4%B8%AD%E6%96%87.html`); `goToPath`
+					encodes it on the way out.
+				-->
+				<label class="pages-read__address-label" for="pages-read-address">{{ t('pages', 'Address') }}</label>
+				<input
+					id="pages-read-address"
+					ref="addressInput"
+					v-model="pathInput"
+					type="text"
+					class="pages-read__address"
+					autocomplete="off"
+					spellcheck="false"
+					:disabled="previewBase === ''"
+					@keyup.enter="goToPath">
+				<NcButton variant="secondary" :disabled="previewBase === ''" @click="goToPath">
+					{{ t('pages', 'Go') }}
+				</NcButton>
+				<span class="pages-read__spacer" />
+				<!--
+					Reload the page the frame is showing. The key on the iframe rebuilds it, which makes
+					the browser request the current address again through the current token — for a
+					page that failed to load, or whose assets were rebuilt, without retyping anything.
+				-->
+				<NcButton
+					variant="tertiary"
+					:disabled="frameUrl === ''"
+					:aria-label="t('pages', 'Refresh')"
+					:title="t('pages', 'Refresh')"
+					@click="reloadSitePreview">
+					<template #icon><Refresh :size="20" /></template>
+					{{ t('pages', 'Refresh') }}
+				</NcButton>
+				<NcButton variant="tertiary" @click="closeSitePreview">
+					{{ t('pages', 'Close the preview') }}
+				</NcButton>
+			</div>
+			<!-- The refusal of an address belongs next to the field, never in a toast. -->
+			<NcNoteCard v-if="pathError" type="error" class="pages-read__path-error">
+				{{ pathError }}
+			</NcNoteCard>
+			<iframe
+				ref="siteFrame"
+				:key="frameReloadKey"
+				class="pages-read__frame pages-read__site-frame"
+				:src="frameUrl"
+				sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals"
+				referrerpolicy="no-referrer"
+				@load="onSiteFrameLoad" />
+		</div>
+
+		<template v-if="!sitePreview && selected">
 			<div class="pages-read__bar">
 				<NcButton variant="tertiary" :disabled="loadingArticle" @click="closeArticle">
 					<template #icon><ArrowLeft :size="20" /></template>
@@ -66,11 +127,18 @@
 		</template>
 
 		<!-- ---------------------------------------------------------------- the list -->
-		<template v-else>
+		<template v-else-if="!sitePreview">
 			<div class="pages-read__head">
 				<h2 class="pages-read__heading">{{ t('pages', 'Read') }}</h2>
-				<span v-if="total" class="pages-read__summary">{{ t('pages', '%s articles', [String(total)]) }}</span>
+				<span v-if="total && !sitePreview" class="pages-read__summary">{{ t('pages', '%s articles', [String(total)]) }}</span>
 				<span class="pages-read__spacer" />
+				<NcButton
+					variant="tertiary"
+					:disabled="previewBase === ''"
+					:title="t('pages', 'Open the built site at index.html')"
+					@click="openSitePreview">
+					{{ t('pages', 'Preview the site') }}
+				</NcButton>
 				<NcButton variant="tertiary" :disabled="loading" @click="reload">
 					<template #icon>
 						<NcLoadingIcon v-if="loading" :size="20" />
@@ -80,7 +148,7 @@
 				</NcButton>
 			</div>
 
-			<div class="pages-read__filters">
+			<div v-if="!sitePreview" class="pages-read__filters">
 				<div class="pages-read__tags">
 					<NcButton
 						:variant="tag === '' ? 'primary' : 'tertiary'"
@@ -122,10 +190,6 @@
 				</NcButton>
 			</div>
 
-			<NcNoteCard v-if="banner" :type="banner.type" class="pages-read__notice">
-				{{ banner.message }}
-			</NcNoteCard>
-
 			<NcLoadingIcon v-if="loading && !articles.length" :size="20" />
 			<p v-else-if="error" class="pages-read__muted">{{ error }}</p>
 			<p v-else-if="articles.length === 0" class="pages-read__muted">{{ emptyMessage }}</p>
@@ -143,8 +207,8 @@
 					</button>
 					<span class="pages-read__row-side">
 						<!-- The review state, with the same label and colour family the article tables use. -->
-						<span class="pages-read__badge" :class="'pages-read__badge--' + stateKind(article.state)">
-							{{ stateLabel(article.state) }}
+						<span class="pages-read__badge" :class="'pages-read__badge--' + stateKind(article.state, article)">
+							{{ entryStateLabel(article.state, article) }}
 						</span>
 						<span class="pages-read__row-counts">
 							<span :title="t('pages', 'Upvotes')">↑ {{ article.up || 0 }}</span>
@@ -177,7 +241,7 @@ import Refresh from 'vue-material-design-icons/Refresh.vue'
 import api from './api.js'
 import CommentThread from './CommentThread.vue'
 import VoteWidget from './VoteWidget.vue'
-import { formatDate, stateKind, stateLabel } from './articles.js'
+import { entryStateLabel, formatDate, stateKind, stateLabel } from './articles.js'
 import {
 	STATE_FILTERS,
 	SORTS,
@@ -218,7 +282,7 @@ export default {
 			type: String,
 			default: '',
 		},
-		/** The parent's banner, used for a refused vote the same way every other failure is reported */
+		/** The parent's toast, used for a refused vote the same way every other failure is reported */
 		showBanner: {
 			type: Function,
 			default: () => {},
@@ -227,6 +291,33 @@ export default {
 
 	data() {
 		return {
+			/** True while the built site itself is on screen (index.html). */
+			sitePreview: false,
+			/**
+			 * The site-relative path the frame last loaded, in the **encoded** form a URL needs:
+			 * `onSiteFrameLoad` writes it from the frame's own (encoded) pathname, and `followBase`
+			 * spells it into the next `frameUrl` as is. `pathInput` holds the readable form of the
+			 * same path; this one is never displayed.
+			 */
+			sitePreviewPath: 'index.html',
+			/**
+			 * The actual iframe src: the base plus the path that was asked for. Only opening the
+			 * preview and `goToPath` write it — `onSiteFrameLoad` follows the frame but never
+			 * re-points it, or every internal link click would reload the frame onto itself.
+			 */
+			frameUrl: '',
+			/**
+			 * Bumped by `reloadSitePreview`. It is the iframe's key, so a bump destroys and recreates
+			 * the frame: the address is requested again, while path, field and error stay untouched.
+			 */
+			frameReloadKey: 0,
+			/**
+			 * What the address field holds, in **readable** form (中文, not %E4%B8%AD…): it follows
+			 * the frame unless the reader is typing, and `goToPath` encodes it before building a URL.
+			 */
+			pathInput: 'index.html',
+			/** Why the address in the field was refused; shown under the field, never as a toast. */
+			pathError: '',
 			SORTS,
 			STATE_FILTERS,
 			articles: [],
@@ -238,9 +329,6 @@ export default {
 			sort: SORTS[0],
 			loading: false,
 			error: '',
-			/** Local notices about a refused action, kept apart from the parent's banner */
-			banner: null,
-			bannerTimer: null,
 
 			/** The article being read, or null while the list is shown */
 			selected: null,
@@ -273,8 +361,15 @@ export default {
 		},
 	},
 
-	beforeUnmount() {
-		window.clearTimeout(this.bannerTimer)
+	watch: {
+		/**
+		 * The parent rotates the preview token while the frame may be open; the address the frame
+		 * holds carries the old token, and the old token answers 403. The rule lives in
+		 * `followBase`, so the proof can exercise it without the watcher's plumbing.
+		 */
+		previewBase(nextBase, previousBase) {
+			this.followBase(nextBase, previousBase)
+		},
 	},
 
 	mounted() {
@@ -289,7 +384,194 @@ export default {
 		sortLabelKey,
 		scoreLabel,
 		stateLabel,
+		entryStateLabel,
 		stateKind,
+
+		/** Show the built site itself, from its index page. */
+		openSitePreview() {
+			if (this.previewBase === '') {
+				this.showBanner('error', t('pages', 'The preview is not available yet.'))
+				return
+			}
+			this.selected = null
+			this.sitePreviewPath = 'index.html'
+			this.pathInput = 'index.html'
+			this.pathError = ''
+			this.frameUrl = this.previewBase + 'index.html'
+			this.sitePreview = true
+		},
+
+		closeSitePreview() {
+			this.sitePreview = false
+			// the next open starts at the site's front page again
+			this.sitePreviewPath = 'index.html'
+			this.pathInput = 'index.html'
+			this.pathError = ''
+		},
+
+		/**
+		 * Load the current address again. The iframe's key changes, so the browser builds a new
+		 * frame for the same `frameUrl` and requests it — through whatever token `frameUrl` holds
+		 * now. Nothing else is touched: the address the reader typed, the tracked path and the
+		 * inline error all stay as they are.
+		 */
+		reloadSitePreview() {
+			if (this.frameUrl === '') {
+				// no address, nothing to request (and no key bump that would imply a load happened)
+				return
+			}
+			this.frameReloadKey += 1
+		},
+
+		/** 百分号编码的站点路径 → 人类可读形式（解码失败时原样返回，绝不抛错）。 */
+		readablePath(path) {
+			try {
+				return decodeURIComponent(String(path || ''))
+			} catch (error) {
+				// a lone `%` (or any other invalid escape) is part of the file name: keep it as typed
+				return String(path || '')
+			}
+		},
+
+		/**
+		 * 可读路径 → 可以拼进 iframe src 的路径：逐段 encodeURIComponent，保留 `/` 分隔。
+		 * 查询串与锚点原样保留（按第一个 `?` 或 `#` 切开，只编码前面的路径部分）。
+		 */
+		urlPath(readable) {
+			const text = String(readable ?? '')
+			const cut = text.search(/[?#]/)
+			const path = cut === -1 ? text : text.slice(0, cut)
+			const suffix = cut === -1 ? '' : text.slice(cut)
+			// one segment at a time: `encodeURIComponent` would escape the `/` separators too
+			return path.split('/').map((segment) => encodeURIComponent(segment)).join('/') + suffix
+		},
+
+		/**
+		 * The address in the field, as a site-relative path, or the reason it is not one. The path
+		 * returned is the **readable** form: a pasted `%E4%B8%AD…` address is decoded first, so the
+		 * field always ends up holding something a reader can edit, and `goToPath` encodes it again.
+		 *
+		 * Only paths inside the built site can be previewed: the frame is served through this app's
+		 * own preview mount, so a full URL would either be refused by the browser or take the frame
+		 * somewhere the token does not reach. A `..` segment is refused for the same reason — the
+		 * mount is not a place to climb out of.
+		 */
+		normalizeAddress(raw) {
+			const value = this.readablePath(String(raw ?? '').trim())
+			if (value === '') {
+				return { path: '', error: t('pages', 'Enter a page address.') }
+			}
+			if (value.includes('://') || value.split('/').includes('..')) {
+				return { path: '', error: t('pages', 'Only paths inside the site can be previewed, not a full URL.') }
+			}
+			let path = value.replace(/^\/+/, '')
+			if (path === '' || path.endsWith('/')) {
+				// a directory address is the friendliest form: `docs/` means `docs/index.html`
+				path += 'index.html'
+			}
+			return { path, error: '' }
+		},
+
+		/**
+		 * Load the address in the field. This and `openSitePreview` are the only two places the
+		 * frame is pointed anywhere; the frame's own navigations are followed, not driven.
+		 */
+		goToPath() {
+			const { path, error } = this.normalizeAddress(this.pathInput)
+			if (error !== '') {
+				this.pathError = error
+				return false
+			}
+			const encoded = this.urlPath(path)
+			this.pathError = ''
+			this.sitePreviewPath = encoded
+			this.pathInput = path
+			if (this.previewBase === '') {
+				// the field is disabled without a token; a programmatic call must not build a
+				// URL that can only end in a 404
+				return false
+			}
+			this.frameUrl = this.previewBase + encoded
+			return true
+		},
+
+		/**
+		 * Re-point the frame at a rotated preview token. The parent replaces the token while the
+		 * frame may be open, and an address carrying the old one answers 403.
+		 *
+		 * The path kept is the page the reader is **on** — `sitePreviewPath`, which
+		 * `onSiteFrameLoad` keeps in step with the frame's own navigations — not the address the
+		 * frame was opened with: a token rotation must not send somebody back to the front page
+		 * mid-read. The old `frameUrl` is only the fallback for the moment the tracked path is not
+		 * known yet, and an empty path still means the site's front page.
+		 */
+		followBase(nextBase, previousBase) {
+			if (!this.sitePreview || this.frameUrl === '') {
+				return
+			}
+			const base = String(nextBase || '')
+			if (base === '') {
+				// no token, no address: a frame on the stale one would only show an error page
+				this.frameUrl = ''
+				return
+			}
+			let relative = String(this.sitePreviewPath || '').replace(/^\/+/, '')
+			if (relative === '') {
+				const previous = String(previousBase || '')
+				relative = (previous !== '' && this.frameUrl.startsWith(previous)
+					? this.frameUrl.slice(previous.length)
+					: this.frameUrl.replace(/^.*?\/preview\/[^/]+\//, ''))
+					.replace(/^\/+/, '')
+			}
+			if (relative === '') {
+				relative = 'index.html'
+			}
+			this.frameUrl = base + relative
+			/*
+			 * The field shows the page the frame is being reloaded onto, unless the reader is typing
+			 * in it: a rotation must not pull a half-typed address out from under the cursor. The
+			 * path kept is encoded (it is a URL segment); the field is readable text.
+			 */
+			if (typeof document === 'undefined' || document.activeElement !== this.$refs?.addressInput) {
+				this.pathInput = this.readablePath(relative)
+			}
+		},
+
+		/**
+		 * Follow the preview where the reader goes. The frame is served through the app's own
+		 * `/preview/<token>/` mount, so its location is same-origin and readable; the token segment is
+		 * the app's plumbing and is stripped, leaving the site-relative path the header should show.
+		 *
+		 * A sandbox or origin refusal is not an error to report: the last known path stays and the
+		 * frame keeps working. Only the address line is potentially stale, which is the honest failure.
+		 */
+		onSiteFrameLoad() {
+			try {
+				const pathname = String(this.$refs.siteFrame?.contentWindow?.location?.pathname || '')
+				if (pathname === '') {
+					return
+				}
+				// the mount is /preview/<token>/<path>: everything before the path is the app's own URL.
+				// Non-greedy: a site may itself have a folder called `preview`, and the first mount
+				// segment is the token, not the last `/preview/` in the address.
+				const path = pathname.replace(/^.*?\/preview\/[^/]+\//, '')
+				// the pathname is percent-encoded (that is what the frame loaded): the tracked path
+				// stays in that form, the field gets the readable form of the same page
+				this.sitePreviewPath = path === '' ? 'index.html' : path
+				/*
+				 * The field follows the frame, so a link click shows where it went — but never while
+				 * the reader is typing in it: pulling a half-typed address out from under the cursor
+				 * is the one thing following along must not do. `document` does not exist in the
+				 * server-side proof, which is also not somebody typing.
+				 */
+				if (typeof document === 'undefined' || document.activeElement !== this.$refs?.addressInput) {
+					this.pathInput = this.readablePath(this.sitePreviewPath)
+				}
+			} catch (error) {
+				// expected when the frame is not inspectable (cross-origin or sandbox refusal)
+				console.debug('[pages] preview path not readable:', error)
+			}
+		},
 
 		/** The list and its counts, always from the server: the filters and the sort are its business. */
 		async reload() {
@@ -418,15 +700,6 @@ export default {
 		hasTags(article) {
 			return Array.isArray(article?.tags) && article.tags.length > 0
 		},
-
-		/** A local notice for something the parent's banner should not own (a refused vote). */
-		showNotice(type, message) {
-			this.banner = { type, message }
-			window.clearTimeout(this.bannerTimer)
-			this.bannerTimer = window.setTimeout(() => {
-				this.banner = null
-			}, 10000)
-		},
 	},
 }
 </script>
@@ -478,10 +751,6 @@ export default {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 4px;
-}
-
-.pages-read__notice {
-	margin: 0;
 }
 
 .pages-read__muted,
@@ -626,5 +895,70 @@ export default {
 	height: 100%;
 	border: 0;
 	background: #fff;
+}
+
+/* the site preview fills the pane the same way an article does */
+.pages-read__site {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	flex: 1 1 auto;
+	min-height: 0;
+}
+
+.pages-read__site-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	/* three parts: the address bar (it shrinks), the reload button, the close button */
+	flex-wrap: wrap;
+}
+
+/* "Address" is a label for the field, not a heading: small and quiet, like the rest of the head. */
+.pages-read__address-label {
+	font-size: 12px;
+	opacity: 0.7;
+	white-space: nowrap;
+}
+
+/*
+ * The one editable control of this view. It grows with the pane (the two buttons keep their
+ * widths) and is set in the monospace face: it is a path, not prose. Its text is the readable
+ * form of the path — Chinese file names stay Chinese, they are only encoded on the way to `src`.
+ */
+.pages-read__address {
+	flex: 1 1 14em;
+	min-width: 8em;
+	padding: 4px 8px;
+	font-family: var(--font-family-monospace, monospace);
+	font-size: 12px;
+	color: var(--color-main-text);
+	background-color: var(--color-main-background);
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius);
+}
+
+.pages-read__address:disabled {
+	opacity: 0.6;
+	cursor: not-allowed;
+}
+
+/*
+ * A refused address is reported here, next to what was typed — never as a toast.
+ * The card is NcNoteCard, as every other notice in this view: colours, icon, wrapping and the
+ * `role="alert"` it sets for an error are the component's. Only its `margin: 1rem 0` is undone —
+ * `.pages-read__site` already spaces its children by 8px.
+ */
+.pages-read__path-error {
+	margin: 0;
+}
+
+.pages-read__site-frame {
+	width: 100%;
+	min-height: 0;
+	flex: 1 1 auto;
+	border: 1px solid var(--color-border);
+	border-radius: var(--border-radius);
+	background: var(--color-main-background);
 }
 </style>

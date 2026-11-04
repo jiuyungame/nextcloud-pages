@@ -30,7 +30,7 @@ use OCP\Server;
  *
  * There are two grants beside the administrator: **authoring** (write in one's own folder) and
  * **review-and-publish** (decide about visibility requests *and* publish them - one permission since
- * the publish grant was merged into review, see {@see \OCA\Pages\Service\PermissionMigration}).
+ * the publish grant was merged into review).
  */
 abstract class BaseController extends Controller
 {
@@ -82,7 +82,7 @@ abstract class BaseController extends Controller
     /**
      * The edit capability. One grant covers both halves of the job now: the review grant is 审核与发布,
      * so "write the site's own files / build / push" and "decide about a request" are the same
-     * permission (see {@see PermissionMigration}). Kept as its own name because the endpoints that ask
+     * permission. Kept as its own name because the endpoints that ask
      * it mean the site's own tree, which may become a separate question again.
      */
     protected function canEdit(): bool
@@ -94,7 +94,7 @@ abstract class BaseController extends Controller
      * The one grant beside authoring: an administrator, or a member of one of the groups granted
      * reviewing. 审核与发布 — deciding about a visibility request, the direct take-down, comment
      * moderation, and publishing (building, diffing, pushing, the site's own files and other authors'
-     * areas). The retired `publish_groups` list is not read: the migration merged it into this one.
+     * areas). The retired `publish_groups` list is not read any more: this grant carries publishing.
      */
     protected function canReview(): bool
     {
@@ -201,26 +201,24 @@ abstract class BaseController extends Controller
     }
 
     /**
-     * Push the author sources and let the bridge rebuild.
+     * Push the site configuration and let the bridge rebuild.
      *
-     * An author area is mirrored from the entry list the app sends, so a file the app has just added,
-     * renamed or removed only reaches the working copy once the configuration travels again. Without
-     * this, an author's new article would wait for the next push by an administrator before it shows
-     * up in the preview or the build. The file itself is already saved, so a failure is reported and
-     * never thrown.
+     * Author content is no longer part of this payload: the steady state is one file-event delta per
+     * change ({@see \OCA\Pages\Service\AuthorDeltaService}), and the one-shot overwrite carries the
+     * complete author state. The call therefore refreshes the bridge's site configuration after a
+     * save; `$drop` is still accepted for the call sites that name a deletion, but there is no author
+     * block left to apply it to. The file itself is already saved, so a failure is reported and never
+     * thrown.
      *
-     * `$drop` names the targets the caller deleted (see AuthorSourcesService::build()): the mirror
-     * applies a removal when it next runs, so it has to be repeated here rather than left to the push
-     * of the step that decided it.
-     *
-     * @param list<string> $drop target paths that have to leave the mirror
+     * @param list<string> $drop target paths the caller deleted (kept for the call sites, not sent)
      * @return array<string,mixed>
      */
     protected function syncAuthorSources(array $drop = []): array
     {
         try {
-            // the author payload belongs to the service that owns it: pushing the site alone would send
-            // the bridge a configuration without the authors block and drop them from the mirror
+            // the push is the site configuration only: author content travels through the delta service,
+            // and the one-shot overwrite carries the complete state; there is no author block left for
+            // $drop to apply to
             $outcome = Server::get(AuthorSourcesService::class)->pushWithAuthors($this->bridge, null, $drop);
             $notified = $this->bridge->notify();
             // a push that reached the bridge clears the record of the last one that did not: the doctor
@@ -287,11 +285,31 @@ abstract class BaseController extends Controller
     protected function translate(\Throwable $e): ?DataResponse
     {
         if ($e instanceof BridgeException) {
+            if ($e->getBridgeCode() === 'CONFIRM_REQUIRED') {
+                // the confirmation dialog reads `exists` next to the code, like the bridge's own payload
+                return new DataResponse(
+                    ['error' => 'CONFIRM_REQUIRED', 'message' => $e->getMessage()] + $e->getDetails(),
+                    Http::STATUS_CONFLICT,
+                );
+            }
             $status = match ($e->getBridgeCode()) {
                 'NOT_CONFIGURED' => Http::STATUS_PRECONDITION_FAILED,
                 'PROTOCOL_MISMATCH' => Http::STATUS_PRECONDITION_FAILED,
                 'UNREACHABLE' => Http::STATUS_SERVICE_UNAVAILABLE,
                 'MIRROR_DELETE_GUARD' => Http::STATUS_CONFLICT,
+                'CONFIRM_REQUIRED' => Http::STATUS_CONFLICT,
+                // the bytes under review are no longer the approved ones: the caller has to ask for a
+                // new request, not retry the same call
+                'DIGEST_MISMATCH' => Http::STATUS_CONFLICT,
+                // the commit tree is not the source/ + online/ assembly, and the bridge refused the
+                // publish before doing anything: the tree has to be rebuilt, so the same call would
+                // only repeat the verdict
+                'WORK_DRIFT' => Http::STATUS_CONFLICT,
+                // the author content directory could not be moved: the bridge's move is all or
+                // nothing, so it put the files it had already moved back under the old name and kept
+                // the old root, and the app put its stored value back too - nothing is in force on
+                // either side, and the same call can be repeated
+                'AUTHOR_ROOT_MOVE_FAILED' => Http::STATUS_CONFLICT,
                 default => Http::STATUS_BAD_GATEWAY,
             };
             $response = new DataResponse($e->toArray(), $status);
@@ -330,6 +348,20 @@ abstract class BaseController extends Controller
         if ($e instanceof \OCP\Files\NotFoundException) {
             return new DataResponse(['error' => 'NOT_FOUND', 'message' => $e->getMessage()], Http::STATUS_NOT_FOUND);
         }
+        if ($e instanceof \OCP\Lock\LockedException) {
+            // A site folder (or a parent of it) was held by another request: the same conflict a
+            // failed replacement reports, so a client sees one status for "try again shortly"
+            // whichever path the lock reached it through. The lock's own text names the path.
+            $message = $e->getMessage();
+
+            return new DataResponse(
+                [
+                    'error' => 'SITE_LOCKED',
+                    'message' => $message !== '' ? $message : $this->l10n->t('The site folder is locked by another request.'),
+                ],
+                Http::STATUS_CONFLICT,
+            );
+        }
         if ($e instanceof \OCP\Files\NotPermittedException) {
             return new DataResponse(['error' => 'FORBIDDEN', 'message' => $e->getMessage()], Http::STATUS_FORBIDDEN);
         }
@@ -337,6 +369,75 @@ abstract class BaseController extends Controller
             return new DataResponse(['error' => 'BAD_REQUEST', 'message' => $e->getMessage()], Http::STATUS_BAD_REQUEST);
         }
         return null;
+    }
+
+    /**
+     * A failed author-root move as the administrator has to read it.
+     *
+     * The bridge's move is all or nothing and runs **before** it adopts the new root: on a 409
+     * `AUTHOR_ROOT_MOVE_FAILED` it has already put the files it moved back under the old name, the old
+     * root stays in force there, and this app has put its stored value back as well. The common answer
+     * is therefore "nothing was changed" - but the rollback is best effort. `rollback_failed` names the
+     * files that could not be put back: they are still under the new name and are not part of the site,
+     * so that sentence would be false exactly when an administrator has something to clean up. The
+     * bridge's code, status and details travel unchanged in both cases; only the sentence in front of
+     * its message depends on the list.
+     */
+    protected function authorRootMoveFailed(\Throwable $e): \Throwable
+    {
+        if (!$e instanceof BridgeException || $e->getBridgeCode() !== 'AUTHOR_ROOT_MOVE_FAILED') {
+            return $e;
+        }
+
+        $details = $e->getDetails();
+        $rollbackFailed = [];
+        $reported = $details['rollback_failed'] ?? null;
+        foreach (is_array($reported) ? $reported : [] as $path) {
+            if (is_string($path) && $path !== '') {
+                $rollbackFailed[] = $path;
+            }
+        }
+        if ($rollbackFailed === []) {
+            return new BridgeException(
+                $this->l10n->t('The author content directory could not be moved; nothing was changed. %s', [$e->getMessage()]),
+                $e->getBridgeCode(),
+                $details,
+                $e->getHttpStatus(),
+            );
+        }
+
+        // The bridge moved `moved` files and then tried to put all of them back; the ones it could not
+        // are exactly `rollback_failed`. Without the counts (an older answer) `remaining` is the only
+        // size the answer carries, so the sentence uses it instead of inventing a number.
+        $moved = $details['moved'] ?? null;
+        $movedCount = null;
+        if (is_array($moved)) {
+            $movedCount = 0;
+            foreach ($moved as $count) {
+                if (is_int($count)) {
+                    $movedCount += $count;
+                } elseif (is_string($count) && ctype_digit($count)) {
+                    $movedCount += (int)$count;
+                }
+            }
+        } elseif (is_int($moved)) {
+            $movedCount = $moved;
+        }
+        $remaining = $details['remaining'] ?? null;
+        $putBack = $movedCount !== null
+            ? max(0, $movedCount - count($rollbackFailed))
+            : (is_array($remaining) ? count($remaining) : 0);
+        $sample = array_slice($rollbackFailed, 0, 3);
+
+        return new BridgeException(
+            $this->l10n->t(
+                'The author content directory could not be moved; %d file(s) were put back, but %d file(s) are still under the new name and are not part of the site: %s. Retry the change, or move them back by hand.',
+                [$putBack, count($rollbackFailed), implode(', ', $sample)],
+            ),
+            $e->getBridgeCode(),
+            $details,
+            $e->getHttpStatus(),
+        );
     }
 
     /**

@@ -14,6 +14,8 @@ from .util import read_json, write_json
 
 @dataclass
 class SiteState:
+    """The one site's persisted bookkeeping: last build, build sequence and the bootstrap marker."""
+
     path: Path
     data: dict[str, Any] = field(default_factory=dict)
 
@@ -65,6 +67,21 @@ class SiteState:
         self.data["build_seq"] = value
         self.save()
         return value
+
+    @property
+    def last_onlinepreview_build(self) -> dict[str, Any] | None:
+        """The last build of the review tree (``onlinepreview``), kept apart from ``last_build``."""
+        return self.data.get("last_onlinepreview_build")
+
+    def record_onlinepreview_build(self, record: dict[str, Any]) -> None:
+        """Record a build of the review tree in its own key.
+
+        The two trees are built independently, so their records are independent: ``last_build`` is
+        the author preview the app reads (the ``/site/log`` route and the status panel), and a review
+        build must neither replace it nor appear in its build history.
+        """
+        self.data["last_onlinepreview_build"] = record
+        self.save()
 
     @property
     def bootstrapped(self) -> bool:

@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OCA\Pages\Command;
 
 use OCA\Pages\Db\Article;
+use OCA\Pages\Service\AuthorAreaService;
+use OCA\Pages\Service\FileService;
 use OCA\Pages\Service\ReviewStore;
 use OCP\IL10N;
 use Symfony\Component\Console\Command\Command;
@@ -14,19 +16,28 @@ use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
 /**
- * `occ pages:manifest` — the review manifest: which article is in which state, and which files the site
- * has.
+ * `occ pages:manifest` — the review manifest: which article is in which state, and what the site
+ * serves.
  *
  * Read-only. The manifest lives in the app's own storage under appdata
  * (`appdata_<instanceid>/pages/review.json`), which the Files app does not show and nothing serves over
  * HTTP, so this is how an administrator inspects it - and `--json` prints the document itself, in the
  * bytes the app writes, which is what a backup needs.
+ *
+ * The state column is derived, exactly like the app derives it: a take-down request means `requested`,
+ * otherwise `online/` makes an article `external` and the absence of it `internal`. The two content
+ * directories the bridge writes are read here for that reason, and listed as their own counts. The
+ * "source deleted" marker next to a take-down request is derived the same way the review screen derives
+ * it: from the file that is there **now**, not from the flag the request recorded when it was filed
+ * ({@see self::sourceDeleted()}).
  */
 class Manifest extends Command
 {
     public function __construct(
         private ReviewStore $store,
         private IL10N $l10n,
+        private FileService $files,
+        private AuthorAreaService $areas,
     ) {
         parent::__construct();
     }
@@ -34,7 +45,7 @@ class Manifest extends Command
     protected function configure(): void
     {
         $this->setName('pages:manifest')
-            ->setDescription('Show the review manifest (article states and published files)')
+            ->setDescription('Show the review manifest (article states and what the site serves)')
             ->addOption('json', null, InputOption::VALUE_NONE, 'Print the manifest as JSON, for a backup');
     }
 
@@ -51,18 +62,20 @@ class Manifest extends Command
         $output->writeln($this->l10n->t('Review manifest: %s', [$location]));
         if (!$this->store->exists()) {
             // the same answer the app gives: no decisions were recorded yet, on this site
-            $output->writeln($this->l10n->t('It is not there yet; the first review action (submit, approve or publish) writes it.'));
+            $output->writeln($this->l10n->t('It is not there yet; the first review action (a request, a decision or a take-down) writes it.'));
 
             return 0;
         }
 
         $manifest = $this->store->read();
         $counts = array_fill_keys(Article::STATES, 0);
-        foreach ($manifest['entries'] as $entry) {
-            $state = (string)$entry['state'];
+        $rows = [];
+        foreach ($manifest['entries'] as $path => $entry) {
+            $state = $this->store->stateIn($manifest, (string)$path);
             $counts[$state] = ($counts[$state] ?? 0) + 1;
+            $rows[(string)$path] = [$state, $entry];
         }
-        $output->writeln($this->l10n->t('Last written: %s', [self::stamp((int)$manifest['updatedAt'])]));
+        $served = $this->store->counts();
         $output->writeln($this->l10n->t(
             'Articles: %d (internal %d · requested %d · external %d)',
             [
@@ -72,45 +85,29 @@ class Manifest extends Command
                 $counts[Article::STATE_EXTERNAL],
             ],
         ));
-        $output->writeln($this->l10n->t('Published files: %d', [count($manifest['published'])]));
+        $output->writeln($this->l10n->t(
+            'Content directories: %d file(s) in online/, %d in pending/',
+            [$served['online'], $served['pending']],
+        ));
 
-        if ($manifest['entries'] !== []) {
+        if ($rows !== []) {
             $table = new Table($output);
             $table->setHeaders([
                 $this->l10n->t('article'),
                 $this->l10n->t('state'),
                 $this->l10n->t('owner'),
-                $this->l10n->t('intent'),
+                $this->l10n->t('take-offline'),
                 $this->l10n->t('decided by'),
                 $this->l10n->t('note'),
             ]);
-            foreach ($manifest['entries'] as $path => $entry) {
+            foreach ($rows as $path => [$state, $entry]) {
                 $table->addRow([
                     $path,
-                    (string)$entry['state'],
+                    $state,
                     (string)$entry['owner'],
-                    (string)$entry['intent'],
+                    self::downRequest($entry['downRequest'] ?? null, $this->sourceDeleted($path, $entry)),
                     (string)$entry['decidedBy'],
                     (string)$entry['note'],
-                ]);
-            }
-            $table->render();
-        }
-
-        if ($manifest['published'] !== []) {
-            $table = new Table($output);
-            $table->setHeaders([
-                $this->l10n->t('published file'),
-                $this->l10n->t('owner'),
-                $this->l10n->t('revision'),
-                $this->l10n->t('published at'),
-            ]);
-            foreach ($manifest['published'] as $path => $entry) {
-                $table->addRow([
-                    $path,
-                    (string)$entry['owner'],
-                    (string)$entry['revision'],
-                    self::stamp((int)$entry['publishedAt']),
                 ]);
             }
             $table->render();
@@ -119,9 +116,51 @@ class Manifest extends Command
         return 0;
     }
 
-    /** A moment as a person reads it; the manifest stores seconds since the epoch. */
-    private static function stamp(int $timestamp): string
+    /**
+     * Whether the source behind one entry is gone **now**, which is the fact the decision reads.
+     *
+     * The manifest's `sourceDeleted` is what the delete path knew when it filed the request; the file
+     * may have come back (or gone) since. One stat per entry that has a request and an author keeps the
+     * CLI and the review screen on the same answer. A site-owned post (`owner` '') has no author area
+     * to read, so the recorded flag is all there is for it.
+     *
+     * @param array<string,mixed> $entry
+     */
+    private function sourceDeleted(string $path, array $entry): bool
     {
-        return $timestamp > 0 ? date('Y-m-d H:i', $timestamp) : '-';
+        $request = $entry['downRequest'] ?? null;
+        if (!is_array($request)) {
+            return false;
+        }
+        $owner = trim((string)($entry['owner'] ?? ''));
+        if ($owner === '') {
+            return ($request['sourceDeleted'] ?? false) === true;
+        }
+        try {
+            $resolved = $this->areas->resolve($owner, $path);
+            if (!$resolved['ok']) {
+                return true;
+            }
+
+            return !$this->files->fileExists($owner, $this->areas->area(), (string)$resolved['file']);
+        } catch (\Throwable) {
+            // a storage that cannot answer is not evidence that the file is there, and the decision
+            // treats the same failure as "gone"; the column must not contradict it
+            return true;
+        }
+    }
+
+    /**
+     * One take-down request as a table cell: the moment and whether the source is deleted now.
+     * `-` is "nothing requested", which is what a null request means.
+     */
+    private static function downRequest(mixed $request, bool $sourceDeleted): string
+    {
+        if (!is_array($request)) {
+            return '-';
+        }
+        $at = (int)($request['at'] ?? 0);
+
+        return ($at > 0 ? date('Y-m-d H:i', $at) : '-') . ($sourceDeleted ? ' · source deleted' : '');
     }
 }

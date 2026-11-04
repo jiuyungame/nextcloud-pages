@@ -10,6 +10,9 @@ ExecStart=/usr/bin/python3 -m pages_bridge -c /etc/pages-bridge/pages-bridge.tom
 WorkingDirectory=/opt/pages-bridge
 Restart=always
 RestartSec=3
+# No RestartPreventExitStatus any more: the old exit 78 guarded a bridge-written target set that no
+# longer exists. The three trees are derived, so a stale or missing tree is rebuilt from the
+# Nextcloud folders at startup instead of refusing to start.
 
 # the service needs read access to the Nextcloud data dir and write access to the work root
 User=root
@@ -21,7 +24,8 @@ Environment=PYTHONUNBUFFERED=1
 
 NoNewPrivileges=true
 
-# PrivateTmp must stay off: the work copy lives in /tmp/pages and has to outlive restarts
+# PrivateTmp stays off: the work root holds data (the commit and review trees live under
+# /var/lib/pages/work by default) and must be reachable at its real path for backups and tools.
 PrivateTmp=false
 
 ProtectSystem=full

@@ -8,14 +8,32 @@ import { t } from './i18n.js'
  * The three visibility states, in the order a list shows them: what waits for a reviewer first, then
  * what is internal, then what the site is going to serve. Kept as one list so the article list, the
  * request panel and the reading view cannot disagree about the order or about a label.
+ *
+ * `requested` means one thing only since the folder-based model: the author asked for a take-off
+ * (`downRequest`). A page waiting to go live is `internal` (or `external` when an update waits) and
+ * carries `candidate: true`; the lists that show it read that flag, not a fourth state.
  */
 const STATE_ORDER = ['requested', 'internal', 'external']
 
-/** State labels, keyed by the values the API uses. */
+/** State labels for the filters, keyed by the values the API uses. */
 const STATE_LABELS = {
 	internal: () => t('pages', 'Internal'),
-	requested: () => t('pages', 'Waiting for review'),
+	requested: () => t('pages', 'Take-off requested'),
 	external: () => t('pages', 'External'),
+}
+
+/**
+ * The label of one entry, from the author's point of view.
+ *
+ * Since the folders are the truth, the state alone no longer says what the author is waiting for: a
+ * `candidate` is a page (or an update) waiting for a reviewer, while `requested` only means a
+ * take-off request. The three labels are therefore derived from the row's own flags first, and only
+ * then from the state: `external` reads **Online** for a settled served entry.
+ */
+const ENTRY_STATE_LABELS = {
+	internal: () => t('pages', 'Internal'),
+	requested: () => t('pages', 'Take-off requested'),
+	external: () => t('pages', 'Online'),
 }
 
 /** Colour family of a state badge; an unknown state is drawn as neutral, not as an error. */
@@ -30,8 +48,62 @@ export function stateLabel(state) {
 	return label ? label() : String(state || '')
 }
 
-export function stateKind(state) {
+/**
+ * The label of one entry in a list, in four cases:
+ *
+ *   1. `candidate: true` → **Waiting for review** (a first publication or an update waits)
+ *   2. `state === 'requested'` → **Take-off requested** (a downRequest waits)
+ *   3. `published: true` → **Online**
+ *   4. otherwise → **Internal**
+ *
+ * `candidate` wins over the state on purpose: a pending request is `internal` or `external` now,
+ * and a stale answer that still calls it `requested` must not be shown as a take-off. An unknown
+ * state is named as it came, never invented.
+ */
+export function entryStateLabel(state, article) {
+	if (article?.candidate === true) {
+		return t('pages', 'Waiting for review')
+	}
+	if (state === 'requested') {
+		return t('pages', 'Take-off requested')
+	}
+	if (article?.published === true) {
+		return t('pages', 'Online')
+	}
+	const label = ENTRY_STATE_LABELS[state]
+	return label ? label() : stateLabel(state)
+}
+
+export function stateKind(state, article) {
+	// a candidate is the one pending thing a state alone cannot name, so its badge is the pending
+	// colour; every other badge keeps the state's own family
+	if (article?.candidate === true) {
+		return 'info'
+	}
 	return STATE_KINDS[state] || 'neutral'
+}
+
+/**
+ * The rows of the request panel: the entries with a pending candidate and the entries carrying a
+ * take-off request. They come from two filters of the same list endpoint (`?awaiting=1` answers only
+ * candidates, `?state=requested` only take-offs, because the state is derived from the folders), so
+ * the panel merges them here. The first list wins on a duplicate, and the empty target is dropped:
+ * a row no endpoint could address is not one this panel may decide.
+ */
+export function mergeRows(...lists) {
+	const seen = new Set()
+	const out = []
+	for (const list of lists) {
+		for (const article of Array.isArray(list) ? list : []) {
+			const key = rowKey(article)
+			if (key === '' || seen.has(key)) {
+				continue
+			}
+			seen.add(key)
+			out.push(article)
+		}
+	}
+	return out
 }
 
 /**
@@ -43,11 +115,7 @@ export function intentOf(article) {
 	return intent === 'online' || intent === 'offline' ? intent : ''
 }
 
-/** Whether the site is serving this article right now (the commit, not the approval). */
-export function isLiveRow(article) {
-	return article?.live === true || article?.live === 1
-}
-
+/** Where a state sorts in a list: what waits for a reviewer, then internal, then external. */
 export function stateRank(state) {
 	const rank = STATE_ORDER.indexOf(state)
 	return rank === -1 ? STATE_ORDER.length : rank

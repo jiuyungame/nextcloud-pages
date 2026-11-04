@@ -407,9 +407,9 @@ class FileService
     }
 
     /**
-     * The site folder of a *different* user than the one being edited (moving the source between two
-     * users, §14). The missing folders up to the site root are created: the target of a copy has to
-     * exist before Node::copy() can be told where to put the tree.
+     * The site folder of one user, created (with any missing parents) when it is not there yet. Used
+     * where the folder has to exist before content can be written: the first author area, and the
+     * replacement of a site folder that Import or Pull is about to fill.
      */
     public function ensureSiteFolder(string $userId, string $ncPath): Folder
     {
@@ -422,8 +422,8 @@ class FileService
             $node = $userFolder->get($path);
         } catch (NotFoundException) {
             // Folder::newFolder() does not create intermediate directories, so a site folder two
-            // levels down ("Sites/blog") fails on a fresh account: walk the segments and create
-            // each missing level. This is the first thing a migration into a new user does.
+            // levels down ("Sites/blog") fails on a fresh account: walk the segments and create each
+            // missing level. Import, Pull and a first author area all start from such a folder.
             $folder = $userFolder;
             $prefix = '';
             foreach (explode('/', $path) as $segment) {
@@ -445,6 +445,38 @@ class FileService
             throw new NotPermittedException($this->l10n->t('Target is not a folder: %s', [$ncPath]));
         }
         return $node;
+    }
+
+    /**
+     * One folder inside the site folder, created (with any missing parents) when it is not there yet.
+     * The site folder itself is created on the way, so this is also the "make the site folder usable"
+     * call of the three fixed subdirectories (`source/`, and the two the bridge owns).
+     *
+     * @throws NotPermittedException when a segment of the path exists and is not a folder
+     */
+    public function ensureSubfolder(string $userId, string $ncPath, string $relPath): Folder
+    {
+        $base = $this->ensureSiteFolder($userId, $ncPath);
+        $rel = $this->clean($relPath);
+        if ($rel === '') {
+            return $base;
+        }
+        $current = $base;
+        $prefix = '';
+        foreach (explode('/', $rel) as $segment) {
+            $prefix = $prefix === '' ? $segment : $prefix . '/' . $segment;
+            try {
+                $next = $current->get($segment);
+            } catch (NotFoundException) {
+                $next = $current->newFolder($segment);
+            }
+            if (!$next instanceof Folder) {
+                throw new NotPermittedException($this->l10n->t('Target is not a folder: %s', [$prefix]));
+            }
+            $current = $next;
+        }
+
+        return $current;
     }
 
     /**
@@ -470,7 +502,7 @@ class FileService
     /**
      * File count and total bytes of a folder tree, read through the Files API. Folders contribute no
      * bytes; every entry is returned as its own path so that a caller can spot entries that appeared
-     * or vanished between two reads (the "source changed while migrating" check).
+     * or vanished between two reads.
      *
      * `$limit` bounds the walk, which only a read-only report may do (preflight on a huge site):
      * `complete` is then false and the numbers are what was read until the limit was reached.
@@ -514,8 +546,8 @@ class FileService
 
     /**
      * Whether the folder itself or one of its direct entries is shared. Shares hang off the file id,
-     * so a later move invalidates them; this only feeds the warning in front of a migration, and a
-     * backend that will not answer reports false rather than blocking the report.
+     * so a later move invalidates them; this only feeds a warning before such a move, and a backend
+     * that will not answer reports false rather than blocking the report.
      */
     public function hasShares(Folder $folder): bool
     {
@@ -550,8 +582,8 @@ class FileService
     }
 
     /**
-     * Removes a folder tree. Used only for the copy a failed migration left behind: the site directory
-     * itself is removed through delete() on the node, so nothing above it is ever touched.
+     * Removes a folder tree. A caller removes the site directory through delete() on the node instead,
+     * so nothing above it is ever touched.
      */
     public function deleteFolder(Folder $folder): void
     {

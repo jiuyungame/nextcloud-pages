@@ -1,11 +1,21 @@
 <!--
-	The article table, shared by "My articles", the request panel and the reading list: they show the
-	same article shape and only differ in which columns and which row actions they need.
+	The article table, shared by "My articles" and the request panel: they show the same article shape
+	and only differ in which columns and which row actions they need.
+
+	"My articles" renders title, state, date and actions; the request panel adds author, waiting and
+	review note (title, author, state, date, waiting, review note, actions). The state column is the
+	one a caller can fold away with `grouped` (a table drawn per state needs no badge of its own).
 
 	One CSS grid for the whole table (header and rows share the same template, computed from the
 	visible columns), so the columns line up without a <table> and without a fixed width a long title
 	could push out of shape. Every value is rendered as text by Vue — nothing here builds markup from
 	article data.
+
+	Whether a cell exists is decided by a column-level flag alone (the `show-*` props, and `grouped`
+	for the state column), never by a rule about the row: the header and each row are separate grids
+	sharing one template, so a row that renders one cell fewer does not leave a hole — it shifts every
+	later cell one column left. A row-level condition belongs *inside* the cell, where it can only
+	change the content.
 -->
 <template>
 	<div class="pages-articles">
@@ -13,7 +23,6 @@
 			<span>{{ t('pages', 'Title') }}</span>
 			<span v-if="showAuthor">{{ t('pages', 'Author') }}</span>
 			<span v-if="!grouped">{{ t('pages', 'State') }}</span>
-			<span v-if="showLive">{{ t('pages', 'On the site') }}</span>
 			<span>{{ t('pages', 'Date') }}</span>
 			<span v-if="showWaiting">{{ waitingHeader }}</span>
 			<span v-if="showReviewNote">{{ t('pages', 'Review note') }}</span>
@@ -33,12 +42,22 @@
 				-->
 				<span v-if="requestMarker(row)" class="pages-articles__request">{{ requestMarker(row) }}</span>
 				<!--
+					The source file of this entry was deleted by its author. The row still exists because
+					the deletion filed a take-off request that waits for a reviewer: the sentence is the
+					one fact about the author that the decision needs.
+				-->
+				<span v-if="row.sourceDeleted === true" class="pages-articles__source-deleted">
+					{{ t('pages', 'The author deleted the file.') }}
+				</span>
+				<!--
 					The last save of this article did not reach the bridge. Rendered by the table, acted on by
 					the page that owns the API: the click emits `retryPush` and the parent repeats the push
-					(no request is made here - this component only draws rows).
+					(no request is made here - this component only draws rows). The review tables turn the
+					mark off (`allowRetry`): there `pushFailed` is the server's publish-push flag, not the
+					author's own configuration push this button retries.
 				-->
 				<button
-					v-if="row.pushFailed"
+					v-if="row.pushFailed && allowRetry"
 					type="button"
 					class="pages-articles__push"
 					@click.stop.prevent="$emit('retryPush', row)">
@@ -51,23 +70,8 @@
 			</div>
 
 			<div v-if="!grouped" class="pages-articles__cell">
-				<span class="pages-articles__badge" :class="'pages-articles__badge--' + stateKind(row.state)">
-					{{ stateLabel(row.state) }}
-				</span>
-			</div>
-
-			<!--
-				"Approved for the site" and "did a commit carry it" are two independent facts, so they
-				get two columns: an entry that is `external` but not published yet is approved, and the
-				site will have it after the next publish. In one cell the second badge pushed the first
-				out of line and read as a contradiction; side by side, each column says one thing.
-			-->
-			<div v-if="showLive" class="pages-articles__cell">
-				<span v-if="isLive(row)" class="pages-articles__live" :title="t('pages', 'The site is serving this article: a commit carried it.')">
-					{{ t('pages', 'Online') }}
-				</span>
-				<span v-else class="pages-articles__muted" :title="t('pages', 'No commit has carried this article yet, so the site does not serve it.')">
-					{{ t('pages', 'Not online') }}
+				<span class="pages-articles__badge" :class="'pages-articles__badge--' + stateKind(row.state, row)">
+					{{ entryStateLabel(row.state, row) }}
 				</span>
 			</div>
 
@@ -91,7 +95,7 @@
 
 <script>
 import { t } from './i18n.js'
-import { formatDate, intentOf, isLiveRow, rowKey, stateKind, stateLabel, waitingDays } from './articles.js'
+import { entryStateLabel, formatDate, intentOf, rowKey, stateKind, stateLabel, waitingDays } from './articles.js'
 
 /**
  * Column widths in order; the template is assembled from the same list the markup follows.
@@ -102,17 +106,15 @@ import { formatDate, intentOf, isLiveRow, rowKey, stateKind, stateLabel, waiting
  * ratio makes every row's columns land on the same x, whatever a row happens to contain.
  *
  * The action column is the widest of the secondary ones on purpose: its buttons carry their labels
- * (NcButton ellipsizes a squeezed label into "Take of…"), and the widest rows - "Bring back online",
- * or "Approve the deletion" next to "Keep the article" - need room for three of them side by side at a
- * normal content width. A row that still needs more room wraps in its own cell instead of truncating
- * a label or spilling into the neighbouring column.
+ * (NcButton ellipsizes a squeezed label into "Take of…"), and the widest rows - "Edit" next to
+ * "Request the update online" and "Request offline", or the manage view's long "Take off the site" -
+ * need room for three of them side by side at a normal content width. A row that still needs more
+ * room wraps in its own cell instead of truncating a label or spilling into the neighbouring column.
  */
 const COLUMNS = {
 	title: 'minmax(0, 3fr)',
 	author: 'minmax(0, 1fr)',
 	state: 'minmax(0, 1.2fr)',
-	/** its own column, so a second badge never pushes the state badge out of line */
-	live: 'minmax(0, 0.8fr)',
 	date: 'minmax(0, 1fr)',
 	waiting: 'minmax(0, 0.8fr)',
 	actions: 'minmax(0, 3.2fr)',
@@ -150,11 +152,6 @@ export default {
 			type: Boolean,
 			default: false,
 		},
-		/** Show whether the site is serving the article (the review queue does not report it) */
-		showLive: {
-			type: Boolean,
-			default: false,
-		},
 		/**
 		 * The caller renders one table per state with its own heading in between, so the state column
 		 * is redundant there — but the grid template still has to match, hence the flag.
@@ -163,12 +160,22 @@ export default {
 			type: Boolean,
 			default: false,
 		},
+		/**
+		 * Whether a row carrying `pushFailed` offers the "not pushed · retry" mark. "My articles"
+		 * does: the flag there is the caller's own configuration push that failed. The review tables
+		 * switch it off, because there `pushFailed` is the server's publish-push flag on any live
+		 * row - a retry of the author's own push could not clear it.
+		 */
+		allowRetry: {
+			type: Boolean,
+			default: true,
+		},
 	},
 
 	/**
 	 * The push retry of a row. A row with `pushFailed` (set by the page that saved it) draws the
 	 * "not pushed · retry" mark; clicking it asks the parent to repeat the push, because only the parent
-	 * holds the API and the author whose targets it covers.
+	 * holds the API and the author whose targets it covers. Emitted only while `allowRetry` is on.
 	 */
 	emits: ['retryPush'],
 
@@ -180,9 +187,6 @@ export default {
 			}
 			if (!this.grouped) {
 				columns.push(COLUMNS.state)
-			}
-			if (this.showLive) {
-				columns.push(COLUMNS.live)
 			}
 			columns.push(COLUMNS.date)
 			if (this.showWaiting) {
@@ -199,6 +203,7 @@ export default {
 	methods: {
 		t,
 		stateLabel,
+		entryStateLabel,
 		stateKind,
 		formatDate,
 		rowKey,
@@ -213,10 +218,18 @@ export default {
 		},
 
 		/**
-		 * The pending request on a row, as one line: which direction the author asked for, so the
-		 * author knows their entry has not moved yet and the reviewer knows what they are deciding.
+		 * The pending snapshot on a row, as one line: whether the entry waits for a first publication
+		 * (`Online requested`), for an update of the version the site serves (`Pending update`, only
+		 * when it is published), or for a take-off (`Take-off request`). The direction is the server's
+		 * derived `intent`; the two snapshot flags say which kind of request it is.
 		 */
 		requestMarker(row) {
+			if (row?.downRequest === true) {
+				return this.withDay(t('pages', 'Take-off request'), row)
+			}
+			if (row?.candidate === true && row?.published === true) {
+				return this.withDay(t('pages', 'Pending update'), row)
+			}
 			const intent = intentOf(row)
 			if (intent === 'online') {
 				return t('pages', 'Online requested on %s', [this.requestDay(row)])
@@ -227,19 +240,16 @@ export default {
 			return ''
 		},
 
+		/** A label with the day the request was filed, when there is one. */
+		withDay(label, row) {
+			const day = this.requestDay(row)
+			return day === '' ? label : `${label} · ${day}`
+		},
+
 		/** The day the request was made, in the reader's own locale; '' when there is no moment. */
 		requestDay(row) {
 			// formatDate already scales seconds to milliseconds; scaling here too produced year 58766
 			return formatDate(Number(row?.submittedAt) > 0 ? Number(row.submittedAt) : '')
-		},
-
-		/**
-		 * Whether the published site is serving this article. The reading list and the request panel
-		 * both report `live`; a row that does not (an older answer) is never marked, so the panels
-		 * cannot disagree about what "live" means.
-		 */
-		isLive(row) {
-			return isLiveRow(row)
 		},
 
 		/**
@@ -340,14 +350,19 @@ export default {
 
 .pages-articles__badge {
 	display: inline-block;
-	/* A state label can be long ("Approved, waiting to be published"): it wraps inside its own cell
-	   instead of running across the next column, which is what `white-space: nowrap` made it do. */
+	/* One line, always: a label that wrapped doubled its row's height and broke the table's rhythm.
+	   The column is sized by ratio (`minmax(0, 1.2fr)`), so the badge gets the same width on every
+	   row and an extreme one is ellipsized instead of wrapping or spilling. The `minmax(0, …)` part
+	   is load-bearing: the header and each row are separate grids, and a `min-content` track would
+	   size itself from its own content and move the columns of other rows. */
 	max-width: 100%;
 	box-sizing: border-box;
 	padding: 1px 8px;
 	border-radius: var(--border-radius-pill, 999px);
 	font-size: 12px;
-	white-space: normal;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 	border: 1px solid transparent;
 }
 
@@ -365,21 +380,20 @@ export default {
 	color: var(--color-success-text, #fff);
 }
 
-/*
- * "On the site" is a fact about the commit, not a workflow state: plain text, so it never reads as a
- * second badge next to the state.
- */
-.pages-articles__live {
-	font-size: 12px;
-	color: var(--color-success-text, var(--color-success));
-	cursor: help;
-}
-
 /* A pending request sits under the article it is about, small and quiet: it is a note, not a state. */
 .pages-articles__request {
 	font-size: 11px;
 	font-style: italic;
 	opacity: 0.75;
+	overflow-wrap: anywhere;
+}
+
+/* The author deleted the source file: a fact about the request, not a state - same quiet shape. */
+.pages-articles__source-deleted {
+	font-size: 11px;
+	font-style: italic;
+	opacity: 0.75;
+	color: var(--color-warning-text, var(--color-text-maxcontrast));
 	overflow-wrap: anywhere;
 }
 

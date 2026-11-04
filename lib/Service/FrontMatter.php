@@ -18,6 +18,34 @@ final class FrontMatter
     public const DEFAULT_PERMALINK = '/:categories/:title:output_ext';
 
     /**
+     * The ASCII characters a bare scalar may contain: the ones this dialect has always written bare
+     * (letters, digits, `_`, `.`, `/`, `-` and the space), plus `:` and `+` - a date and a timestamp
+     * are spelled with those, and quoting one would change its type in YAML 1.1, which is the one
+     * thing this writer must not do to a date (Jekyll sorts and formats on it).
+     *
+     * Everything else out of ASCII is quoted, because every shape YAML gives a meaning to is ASCII:
+     * `*` an alias, `&` an anchor, `!` a tag, `|`/`>` a block scalar, `%` a directive, `@`/`` ` ``
+     * reserved, `#` a comment, `[`/`]`/`{`/`}`/`,` a collection, `?` a key indicator and the quotes
+     * a string. A Chinese character is not made syntax by standing next to them, which is why the
+     * set stops at ASCII and everything above it is text.
+     *
+     * The class is applied to the value's ASCII characters only (the others are dropped first), so
+     * it does not have to spell out "or anything that is not ASCII" a second time.
+     */
+    private const BARE_ASCII = '/^[A-Za-z0-9_.\/+: -]*$/';
+
+    /**
+     * What a bare scalar may not *start* with: YAML's indicators, the two quote characters (they
+     * would open a string the reader then looks the end of), and `,` - a `c-indicator` too, and
+     * `key: ,x` is a parse error rather than text.
+     *
+     * {@see self::BARE_ASCII} already excludes most of these. The test is still needed for `-` and
+     * `:`, the two indicators a value may carry inside it (a date and a timestamp are spelled with
+     * them), and it keeps stating the rule where a later widening of the set would otherwise lose it.
+     */
+    private const LEADING_INDICATOR = '*&!|>%@`#-?:[]{}\'",';
+
+    /**
      * Split a document into its front matter and its body.
      *
      * @return array{data: array<string,mixed>, body: string}
@@ -56,10 +84,15 @@ final class FrontMatter
      *  - a document without a front-matter block gets one, with a blank line before the body, which is
      *    what Jekyll requires to read the block at all;
      *  - a `null` value in `$set` means "remove", so a caller can build one map without branching;
-     *  - nothing throws: unparsable input yields the document unchanged rather than a broken file.
+     *  - an unparsable document is returned unchanged rather than rewritten into a broken file, while a
+     *    value this dialect cannot carry is **refused** (`\InvalidArgumentException`, which the
+     *    controller answers as 400) instead of being written wrong: before anything is written, the
+     *    block about to be produced is read back through {@see self::parse()} and every written key
+     *    has to come back as it went in.
      *
      * @param array<string,mixed> $set   key => value (null removes the key)
      * @param list<string>        $remove keys to drop
+     * @throws \InvalidArgumentException when a value cannot be written and read back the same
      */
     public static function update(string $markdown, array $set, array $remove = []): string
     {
@@ -137,6 +170,14 @@ final class FrontMatter
             if (!isset($seen[$key])) {
                 $out[] = $key . ': ' . self::toYaml($value);
             }
+        }
+
+        // One read-back for the whole block, before the file is touched: a value that would not
+        // survive the trip (a newline that splits it off its key, an indicator the parser reads as
+        // syntax, a `#` that becomes a comment) is refused here, where the caller can still answer
+        // 400, rather than written into a file that says something else.
+        if ($writing !== []) {
+            self::assertRoundTrip($writing, $out);
         }
 
         $body = $parsed['body'];
@@ -244,8 +285,14 @@ final class FrontMatter
     }
 
     /**
-     * One value as YAML. A string that could be read back as another type (or that carries a
-     * character the parser would cut) is quoted, so that a round trip through parse() is stable.
+     * One value as YAML. A value that cannot be written bare - see {@see self::isBare()} - is
+     * double-quoted with its own characters escaped, so a newline stays *inside* the value instead of
+     * splitting the key off it, and an indicator stays text instead of becoming syntax.
+     *
+     * A line break is spelled `\n` (or `\r`) inside the quotes, never as a `|` block scalar: a block
+     * scalar cannot carry the difference between `\n`, `\r\n` and `\r`, and the app has to read back
+     * exactly the bytes it was given. The quoted form is what both Jekyll's YAML reader and
+     * {@see self::scalar()} undo, so the value survives the trip unchanged.
      */
     private static function toYaml(mixed $value): string
     {
@@ -273,18 +320,210 @@ final class FrontMatter
         if ($text === '') {
             return '';
         }
-        $needsQuotes = preg_match('/^[\s]|[\s]$/', $text) === 1
-            || str_contains($text, ' #')
-            || str_contains($text, ': ')
-            || str_contains($text, '"')
-            || str_contains($text, "'")
-            || preg_match('/^(true|false|yes|no|on|off|null|~)$/i', $text) === 1
-            || preg_match('/^-?\d+(\.\d+)?$/', $text) === 1
-            || str_starts_with($text, '[')
-            || str_starts_with($text, '{')
-            || str_starts_with($text, '-');
 
-        return $needsQuotes ? '"' . str_replace(['\\', '"'], ['\\\\', '\\"'], $text) . '"' : $text;
+        return self::isBare($text) ? $text : self::quoted($text);
+    }
+
+    /**
+     * Whether a string may be written as it is.
+     *
+     * This used to be a whitelist of ASCII (`^[A-Za-z0-9_./ -]+$`), which was safe but rewrote files
+     * that were not wrong: a Chinese title came back quoted, and a date came back a *string* where
+     * YAML 1.1 would have read a date. The second one is not cosmetic - Jekyll reads `modified_date`
+     * as a time when the value is a time, and sorts and formats on that - so quoting it changes what
+     * the site builds. What is checked now is what actually breaks a plain scalar:
+     *
+     *  - the value has to be valid UTF-8, or there are no characters to classify;
+     *  - no control or format character - the line breaks {@see self::toYaml()} has to escape among
+     *    them - and no U+2028/U+2029: YAML reads a line break there and the value splits off its key;
+     *  - no leading and no trailing space: a plain scalar is trimmed on the way back in;
+     *  - the first character may not be an indicator (see {@see self::LEADING_INDICATOR});
+     *  - no ` #`, which opens a comment;
+     *  - no `:` followed by a space or by the end of the value, which would make the value a nested
+     *    mapping, or a key with nothing under it;
+     *  - not a word YAML reads as a boolean or as null, and not a number in any spelling YAML 1.1
+     *    accepts ({@see self::isNumberLike()}): written bare, those come back as another type than
+     *    the one the caller wrote, and a title that reads as `true` is not the title that was saved;
+     *  - and, outside those, every ASCII character has to be one {@see self::BARE_ASCII} names.
+     *    Everything above ASCII is text and stays bare, so `中文标题`, `café` and `日本語` keep the
+     *    shape the author gave them.
+     *
+     * Dates and timestamps need no exemption from any of this, which is worth saying out loud
+     * because it looks like they should: `2026-10-31` starts with a digit, `2026-05-01T10:00:00Z`
+     * only uses characters the ASCII set names, and a well-formed stamp puts a digit after every
+     * colon (`10:00:00`, `+08:00`) - never a space, which is the only thing the `:` test looks for.
+     * So they stay bare, and YAML reads them as the date and the timestamp they are. A *malformed*
+     * one (`2026-05-01 10: 00`) does hit the `:` test and is quoted, which is what is wanted.
+     *
+     * The final line of defence is not here: {@see self::update()} parses the block it is about to
+     * write and refuses a value that does not come back as it went in.
+     */
+    private static function isBare(string $text): bool
+    {
+        // a byte string that is not valid UTF-8 has no characters to classify: it is quoted (and
+        // escaped byte by byte) instead of being written out as it came in
+        if (preg_match('//u', $text) !== 1) {
+            return false;
+        }
+        // control (`\n`, `\r`, `\t`, NUL), format (U+FEFF, U+200B ...) and the two Unicode line
+        // separators: each of them ends a line in YAML, so the value would end in the middle of
+        // itself and the rest of it would be read as the next line of the file
+        if (preg_match('/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u', $text) === 1) {
+            return false;
+        }
+        // an empty value has nothing to write bare; a leading space is indentation once read and a
+        // trailing one is trimmed away
+        if ($text === '' || $text[0] === ' ' || str_ends_with($text, ' ')) {
+            return false;
+        }
+        // an indicator at the front turns the value into syntax (see the constant's own note)
+        if (str_contains(self::LEADING_INDICATOR, $text[0])) {
+            return false;
+        }
+        // ` #` opens a comment: everything from there on is not the value any more
+        if (str_contains($text, ' #')) {
+            return false;
+        }
+        // `:` followed by nothing is a key without a value, and followed by a space it starts a
+        // mapping; followed by anything else (`10:00:00`, `+08:00`) it is text
+        if (preg_match('/:(?:[ \t]|\z)/', $text) === 1) {
+            return false;
+        }
+        // every ASCII character has to be one a value may be spelled with; what is left after
+        // dropping the non-ASCII characters is what the class sees
+        $ascii = (string)preg_replace('/[^\x00-\x7F]/', '', $text);
+        if (preg_match(self::BARE_ASCII, $ascii) !== 1) {
+            return false;
+        }
+        // the words YAML spells a boolean or nothing with: bare, they come back as `true` or `null`
+        if (preg_match('/^(?:true|false|yes|no|on|off|y|n|null|~)$/i', $text) === 1) {
+            return false;
+        }
+        // a number in any spelling YAML 1.1 accepts would come back as an int or a float where the
+        // caller wrote text; a date is not one of those spellings (see the test itself)
+        return !self::isNumberLike($text);
+    }
+
+    /**
+     * Whether the text spells a number in a form YAML 1.1 resolves to an int or a float: decimal with
+     * an optional fraction and exponent, `_` as a digit separator, `0x`/`0o`/`0b` radix prefixes,
+     * base 60 (`2:30` is 150, `190:20:30` is 685230) and `.inf`/`.nan`.
+     *
+     * Base 60 and the `_` separator are the two that a plain reading of "a number" misses, and both
+     * change the type of a value that looks like text: `2:30` is an int to YAML, and `1_000` is the
+     * int 1000. Neither is a date - `2026-10-31` has a `-` where only an exponent sign could be, and
+     * the `:` of a timestamp is not the `:` of base 60 - which is why dates need no exemption from
+     * this test.
+     */
+    private static function isNumberLike(string $text): bool
+    {
+        if (preg_match('/^[-+]?(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)(?:[eE][-+]?\d+)?$/', $text) === 1) {
+            return true;
+        }
+        if (preg_match('/^(?:0[xXoObB][0-9a-fA-F_]+|[+-]?\.(?:inf|nan))$/i', $text) === 1) {
+            return true;
+        }
+
+        return preg_match('/^[-+]?\d+(?::\d+)+$/', $text) === 1;
+    }
+
+    /**
+     * A value as a double-quoted YAML scalar, with the escapes both YAML and `stripcslashes()` (what
+     * {@see self::scalar()} uses to read a quoted value back) understand.
+     */
+    private static function quoted(string $text): string
+    {
+        $escaped = strtr($text, [
+            '\\' => '\\\\',
+            '"' => '\\"',
+            "\n" => '\\n',
+            "\r" => '\\r',
+            "\t" => '\\t',
+        ]);
+        // the other control characters have no C escape of their own; `\xNN` is understood by YAML and
+        // by stripcslashes() alike, so a value carrying one still comes back unchanged
+        $escaped = (string)preg_replace_callback(
+            '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/',
+            static fn (array $match): string => sprintf('\\x%02X', ord($match[0])),
+            $escaped,
+        );
+
+        return '"' . $escaped . '"';
+    }
+
+    /**
+     * The block as it is about to be written, read back through {@see self::parse()}: every value the
+     * caller named has to come back as it went in.
+     *
+     * One parse for the whole block, not one per value - the fragment is the exact text the write is
+     * about to produce, and comparing the values it was built from costs nothing extra. A mismatch is
+     * a value this dialect cannot carry (an inline list item carrying a comma, for instance, is split
+     * in two by the reader however it is quoted), and writing it anyway would make the file say
+     * something nobody wrote.
+     *
+     * @param array<string,mixed> $writing
+     * @param list<string>        $lines
+     * @throws \InvalidArgumentException when a value would not read back as it was written
+     */
+    private static function assertRoundTrip(array $writing, array $lines): void
+    {
+        $parsed = self::parse("---\n" . implode("\n", $lines) . "\n---\n")['data'];
+        foreach ($writing as $key => $value) {
+            if (self::sameValue($value, $parsed[$key] ?? null)) {
+                continue;
+            }
+            throw new \InvalidArgumentException(sprintf(
+                'The value of “%s” cannot be written as front matter: it would not read back as it was saved.',
+                $key,
+            ));
+        }
+    }
+
+    /**
+     * Whether a parsed value is the one that was written: the same text, the same boolean, the same
+     * integer, the same number, or the same list. A float is compared as a number because
+     * {@see self::scalar()} reads `1.5` as text (this dialect has no float type) while the value
+     * written is the one that number spells.
+     */
+    private static function sameValue(mixed $written, mixed $parsed): bool
+    {
+        if (is_array($written)) {
+            return is_array($parsed) && self::listOf($written) === self::listOf($parsed);
+        }
+        if (is_bool($written)) {
+            return $parsed === $written;
+        }
+        if (is_int($written)) {
+            return is_int($parsed) && $parsed === $written;
+        }
+        if (is_float($written)) {
+            return is_numeric($parsed) && (float)$parsed === $written;
+        }
+        if (is_string($written)) {
+            return is_string($parsed) && $parsed === $written;
+        }
+
+        return false;
+    }
+
+    /**
+     * A list as the strings {@see self::toYaml()} emits: a null and a nested map are skipped there, and
+     * a scalar is spelled the same way on both sides of the round trip.
+     *
+     * @param array<array-key,mixed> $value
+     * @return list<string>
+     */
+    private static function listOf(array $value): array
+    {
+        $out = [];
+        foreach ($value as $item) {
+            if ($item === null || is_array($item)) {
+                continue;
+            }
+            $out[] = is_bool($item) ? ($item ? 'true' : 'false') : (string)$item;
+        }
+
+        return $out;
     }
 
     /**
@@ -373,9 +612,32 @@ final class FrontMatter
         return $raw;
     }
 
-    /** A trailing ` # comment` is dropped, a `#` inside a value is kept (URLs carry fragments). */
+    /**
+     * A trailing ` # comment` is dropped, a `#` inside a value is kept (URLs carry fragments).
+     *
+     * A value that *is* a quoted scalar keeps its `#`: `"Release #2"` is one value, and cutting it at
+     * the `#` would leave half a quotation behind. Only a quote at the very front of the value opens
+     * one - that is the only shape {@see self::scalar()} strips, so an apostrophe inside a plain value
+     * (`Author's note # by bob`) still starts no string and the comment still goes.
+     */
     private static function stripComment(string $raw): string
     {
+        $raw = ltrim($raw);
+        $quote = $raw !== '' && ($raw[0] === '"' || $raw[0] === "'") ? $raw[0] : '';
+        if ($quote !== '') {
+            for ($i = 1, $n = strlen($raw); $i < $n; $i++) {
+                if ($quote === '"' && $raw[$i] === '\\') {
+                    // an escaped character cannot close the string
+                    $i++;
+                    continue;
+                }
+                if ($raw[$i] === $quote) {
+                    // everything after the closing quote is a comment or nothing at all
+                    return trim(substr($raw, 0, $i + 1));
+                }
+            }
+            // no closing quote: not a quoted scalar after all, so the plain rule applies
+        }
         $at = strpos($raw, ' #');
         if ($at === false) {
             return trim($raw);

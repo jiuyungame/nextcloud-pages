@@ -19,19 +19,35 @@ use OCP\IUserSession;
 /**
  * The visibility endpoints: a page is internal until a reviewer approves it for the site.
  *
- *   POST /api/article/request   {path, intent: 'online'|'offline'}   author of the entry, or a grant
- *   POST /api/article/cancel    {path}                               author of the entry, or a grant
- *   POST /api/article/decision  {path, decision: 'approve'|'reject', note?}   review grant
+ *   POST /api/article/request         {path, intent: 'online'|'offline'}   author of the entry, or a grant
+ *   POST /api/article/cancel          {path}                               author of the entry, or a grant
+ *   POST /api/article/decision        {path, decision: 'approve'|'reject', note?}   review grant
+ *   POST /api/article/take-down       {path, note?}                        review grant
  *
- * The three actions are the whole author/reviewer conversation; publishing itself stays where it was
- * (`POST /api/site/publish`), because it is the same git commit: it stages everything `external` plus
- * the removals of whatever is no longer external, and commits the site's own files for a caller who
- * may also edit.
+ * An **online** request is what asks for content to go out: the bridge freezes the file's current
+ * bytes into the review tree, and a reviewer's approval publishes exactly those bytes. That is also
+ * how an online page asks for its new content to replace what the site serves - there is no separate
+ * update request any more, and an edit alone never enters the queue: the author decides whether the
+ * new content should go out, and the file on disk keeps changing until they ask.
+ *
+ * An **offline** request is only the intention to take the page off the site; the reviewer's approval
+ * carries it out. A take-down is the reviewer's own action for a page with nothing pending.
+ *
+ * Publishing itself stays where it was (`POST /api/site/publish`), because it is the same git commit:
+ * it stages everything the site has a version of plus the removals of whatever it no longer has, and
+ * commits the site's own files for a caller who may also edit.
  *
  * Reading the pending requests needs no endpoint of its own: they are the `requested` entries of the
- * article list (`GET /api/articles?state=requested`), which every signed-in user may read. Deciding
- * them and publishing them are one grant (审核与发布, see \OCA\Pages\Service\PermissionMigration):
- * whoever may decide about somebody's article may also publish what was decided.
+ * article list (`GET /api/articles?state=requested`, or `?awaiting=1` for the entries with a frozen
+ * candidate), which every signed-in user may read. Deciding them and publishing them are one grant
+ * (审核与发布): whoever may decide about somebody's
+ * article may also publish what was decided.
+ *
+ * A decision is recorded before the article cache is refreshed, so a cache failure is not an error
+ * answer: the four actions below answer 200 with `cache_synced: false` and `cache_message` saying why
+ * (see {@see \OCA\Pages\Service\ReviewStore::lastCacheSyncFailed()}), because the decision is already in force
+ * and retrying it would only answer 409 ("no request is pending"). A client should tell the user the
+ * decision was recorded and the queue is still catching up, not that the action failed.
  */
 class ReviewController extends BaseController
 {
@@ -79,6 +95,14 @@ class ReviewController extends BaseController
     #[NoAdminRequired]
     public function cancel(): DataResponse
     {
+        // the same authoring gate as filing a request: a user outside the grant may not start a
+        // visibility change, and withdrawing one is not the exception. A reviewer passes without it,
+        // because a reviewer may have filed the request for somebody else.
+        $author = $this->requireAuthor();
+        if ($author !== null && !$this->canReview()) {
+            return $author;
+        }
+
         return $this->body(fn (string $uid): array => $this->review->cancel(
             $uid,
             $this->pathParam(),
@@ -87,9 +111,12 @@ class ReviewController extends BaseController
     }
 
     /**
-     * The reviewer's answer. `approve` applies the intent (`online` → `external`, `offline` →
-     * `internal`); `reject` puts the entry back to `internal` with the note, and on an `external` entry
-     * it is the direct take-down (下线).
+     * The reviewer's answer. `approve` accepts what the author asked for: a pending online request
+     * publishes its frozen candidate, a pending offline request takes the published version off the
+     * site. `reject` answers the request without doing what it asked, with the note as the reason - a
+     * refused online request discards the candidate and keeps whatever the site already serves, a
+     * refused offline request leaves the page where it is. Nothing pending is a conflict; the
+     * reviewer's direct take-down has its own endpoint ({@see self::takeDown()}).
      */
     #[NoAdminRequired]
     public function decision(): DataResponse
@@ -106,15 +133,51 @@ class ReviewController extends BaseController
             return $this->translate($e) ?? throw $e;
         }
 
-        // A decision is the moment the mirror lists change: an approval puts the file into the
-        // commit tree, a rejection takes it back out of it. The push below carries both lists, so a
-        // taken-down page simply disappears from the on-site list while staying in the preview list;
-        // it is *not* passed as `drop` - that names a file that no longer exists in the author area,
-        // and a take-down keeps the file. Dropping it would delete the page from the preview tree
-        // too, which would make an internal page un-previewable.
+        // The bridge operation travelled with the decision itself - publish, discard or take-down -
+        // so no author delta follows: the review tree, the commit tree, `online/` and the manifest
+        // were moved together by the service. What still follows is the site configuration push and
+        // the rebuild ping, which is what makes the built site reflect the new state.
         return new DataResponse([
             'ok' => true,
             ...$answer,
+            // nothing waits for a decision after one; the snapshot keys stay so a client can refresh
+            // a row without re-reading the list
+            'candidate' => false,
+            'downRequest' => false,
+            'counts' => $this->review->counts(),
+            'bridge' => $this->syncAuthorSources(),
+        ]);
+    }
+
+    /**
+     * The reviewer's direct take-down (下线): take a page the site serves off it, with nothing pending.
+     *
+     * It answers no request, so it is its own endpoint and not a `reject`: a reviewer acts on their
+     * own judgement, and the author is told afterwards with the note as the reason. The bridge drops
+     * the target from the commit tree and from `online/` in one operation, and the manifest drops the
+     * entry (when the source file is gone as well) or clears the request that was waiting for it, so
+     * the next publish carries the removal out of the commit. The article file itself stays in the
+     * author's folder - an internal page is still previewable and editable.
+     */
+    #[NoAdminRequired]
+    public function takeDown(): DataResponse
+    {
+        [$denied] = $this->siteContext('review');
+        if ($denied !== null) {
+            return $denied;
+        }
+        $note = trim((string)$this->request->getParam('note', ''));
+        try {
+            $answer = $this->review->takeDown($this->currentUserId(), $this->pathParam(), $note);
+        } catch (\Throwable $e) {
+            return $this->translate($e) ?? throw $e;
+        }
+
+        return new DataResponse([
+            'ok' => true,
+            ...$answer,
+            'candidate' => false,
+            'downRequest' => false,
             'counts' => $this->review->counts(),
             'bridge' => $this->syncAuthorSources(),
         ]);

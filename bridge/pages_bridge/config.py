@@ -81,13 +81,26 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 DEFAULT_LISTEN = "127.0.0.1:8787"
 DEFAULT_NC_DATA_ROOT = "/var/snap/nextcloud/common/nextcloud/data"
-DEFAULT_WORK_ROOT = "/tmp/pages"
+#: The root of the site's three host trees. All of them are **derived** from the site folder in
+#: Nextcloud (``source/`` + ``online/`` + ``pending/``), so deleting them loses no site data; they
+#: are kept in the same persistent root as the state/override/log directories by default (the
+#: commit tree is a git working tree, so history/backups still matter there), and only ``.git``
+#: inside ``work`` cannot be regenerated from Nextcloud.
+DEFAULT_WORK_ROOT = "/var/lib/pages/work"
 DEFAULT_STATE_DIR = "/var/lib/pages/state"
 DEFAULT_OVERRIDE_DIR = "/var/lib/pages/overrides"
 DEFAULT_LOG_DIR = "/var/lib/pages/logs"
 
 #: The file the app's configuration is written to; always under the TOML's ``state_dir``.
 EFFECTIVE_FILE = "effective.json"
+
+#: Left behind by ``POST /site/reset``: while it exists the TOML's secrets and site table are ignored.
+#: The example install.sh copies carries neither, but a TOML can be filled in by hand, so deleting
+#: only ``effective.json`` would let the next start pair the bridge with its old site again - a reset
+#: has to survive a restart. Only a successful
+#: ``POST /pair`` clears the marker. It lives in the TOML's ``state_dir`` (the *bootstrap* one, like
+#: ``effective.json``): it is read before any pushed configuration is trusted.
+UNPAIRED_FLAG = "reset-unpaired.flag"
 
 
 @dataclass(frozen=True)
@@ -114,18 +127,8 @@ class Recipe:
 
 #: The site directory that receives every author's own tree: author A's files arrive at
 #: ``<author_root>/<A>/…``. It is a single path segment, pushed by the app as ``site.author_root``;
-#: an older client that omits it keeps working with this default. The two legacy areas stay
-#: accepted below, so an instance that has not migrated yet keeps publishing.
+#: an older client that omits it keeps working with this default.
 AUTHOR_ROOT_DEFAULT = "tmp"
-
-#: The two legacy areas of the work copy an author source may write into. Anything outside those
-#: and outside ``<author_root>/<uid>/…`` is refused when the payload is validated, so a second
-#: source can never overwrite the site's own files (or another author's tree).
-AUTHOR_POST_PREFIX = "_posts"
-AUTHOR_ASSET_DIR = "assets/authors"
-
-#: :data:`AUTHOR_ASSET_DIR` as path components, for the checks below.
-_ASSET_PARTS = tuple(AUTHOR_ASSET_DIR.split("/"))
 
 #: Shape of an author root: one path segment that starts with a letter or a digit. The dot and
 #: underscore names are refused on purpose - ``..``/``.git`` would be a path or repository the path
@@ -139,37 +142,22 @@ def author_target_prefixes(uid: str, author_root: str = AUTHOR_ROOT_DEFAULT) -> 
 
     One function, because two lists have to agree: the exclusion the skeleton mirror applies (so it
     never copies over or deletes an author's target) and the validation of the targets the app
-    pushes. The legacy ``_posts/<uid>`` and ``assets/authors`` areas stay in the list while an
-    instance that predates the layout change still publishes.
+    pushes. An author owns exactly ``<author_root>/<uid>``.
     """
-    return tuple(dict.fromkeys((
-        f"{author_root}/{uid}",
-        f"{AUTHOR_POST_PREFIX}/{uid}",
-        AUTHOR_ASSET_DIR,
-    )))
+    return (f"{author_root}/{uid}",)
 
 
 def author_target_allowed(uid: str, target: str, author_root: str = AUTHOR_ROOT_DEFAULT) -> bool:
     """Whether ``target`` (site-relative) is inside the area that belongs to ``uid``.
 
     Allowed: ``<author_root>/<uid>/…`` (the whole tree, at any depth and with any file type - an
-    author's images are entries too), ``_posts/<uid>/…`` (the legacy post area) and the author's own
-    stylesheet, ``assets/authors/<uid>.css`` or ``assets/authors/<uid>/<slug>.css``. Nothing else:
-    the site's own files, another author's tree and another author's stylesheet are out of reach.
+    author's images are entries too). Nothing else: the site's own files and another author's tree
+    are out of reach.
     """
     parts = tuple(target.split("/"))
     if len(parts) < 3 or any(part in ("", ".", "..") for part in parts):
         return False
-    if parts[0] == author_root and parts[1] == uid:
-        return True
-    if parts[0] == AUTHOR_POST_PREFIX:
-        return parts[1] == uid
-    if parts[:2] == _ASSET_PARTS:
-        rest = parts[2:]
-        if rest[0] == f"{uid}.css":
-            return len(rest) == 1
-        return rest[0] == uid and len(rest) >= 2 and rest[-1].lower().endswith(".css")
-    return False
+    return parts[0] == author_root and parts[1] == uid
 
 
 def _clean_relative(value: str) -> tuple[str, ...] | None:
@@ -251,11 +239,32 @@ class AuthorSource:
 
 @dataclass(frozen=True)
 class Site:
+    #: The **site folder** in Nextcloud (``<nc_data_root>/<nc_user>/files/<nc_path>``). It is the
+    #: parent of the three fixed subdirectories; the skeleton itself is :attr:`source_dir`.
     source: Path
+    #: ``source/``: the administrator-edited Jekyll skeleton and the one required input of the
+    #: assembly (a site whose ``source/`` is absent is refused at config time).
+    source_dir: Path
+    #: ``online/``: the **published** content, maintained by ``publish`` and ``take-down``. It is
+    #: data (the bridge writes it into Nextcloud), and it is the overlay that wins over ``source/``.
+    online_dir: Path
+    #: ``pending/``: the **frozen candidate** snapshots, maintained by ``candidate`` and cleared by
+    #: ``publish``/``discard``. It is data too, and the overlay that wins over ``online/`` in the
+    #: review tree.
+    pending_dir: Path
+    #: The commit tree: the assembled skeleton plus the **published** content, merged flat at the
+    #: tree root (``source/`` then ``online/``, same-name wins). It is derived and may be rebuilt; a
+    #: publish commits from here, and the repository it pushes is this flat tree.
     work: Path
-    #: The tree the preview is built from and served from: every author file, internal or external.
-    #: It lives outside the work copy, so a build or a served file can never leak into the commit.
+    #: The tree the preview is built from and served from: ``source/`` → ``online/`` → every author
+    #: folder. It is derived and may be deleted and rebuilt at any time: it lives outside the commit
+    #: tree, so a build or a served file can never leak into what a publish commits.
     preview: Path
+    #: The review tree: ``source/`` → ``online/`` → ``pending/`` (byte for byte equal to the commit
+    #: tree when nothing is pending). It is derived too, and a third tree on purpose: freezing a
+    #: review object into the author's own preview would let a later save move what the reviewer sees.
+    onlinepreview: Path
+    #: ``""`` means "no remote configured": publish still commits, it just never pushes.
     repo_url: str
     branch: str
     remote_name: str
@@ -269,6 +278,11 @@ class Site:
     authors: tuple[AuthorSource, ...] = ()
 
     @property
+    def has_remote(self) -> bool:
+        """Whether a push is possible at all. One answer for every caller, so no client guesses."""
+        return self.repo_url.strip() != ""
+
+    @property
     def output_dir(self) -> Path:
         """The build output the preview serves: always inside the preview tree.
 
@@ -278,20 +292,42 @@ class Site:
         return norm_abs(self.preview / self.recipe.output_dir)
 
     @property
+    def onlinepreview_output_dir(self) -> Path:
+        """Where the review tree is built: its own ``output_dir``, always inside ``onlinepreview``.
+
+        Same rule as :attr:`output_dir`, one tree further: the build command runs with
+        ``cwd = onlinepreview`` and writes here, so the reviewer's copy is served from a directory
+        that neither the author preview nor the commit tree can reach.
+        """
+        return norm_abs(self.onlinepreview / self.recipe.output_dir)
+
+    @property
     def work_output_dir(self) -> Path:
         """Where an old single-tree build put its output; kept only for reports and migrations."""
         return norm_abs(self.work / self.recipe.output_dir)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            # the site folder plus the three fixed subdirectories it contains: the bridge never
+            # guesses them, an app can read them straight off /admin/config and /health
             "source": str(self.source),
+            "source_dir": str(self.source_dir),
+            "online_dir": str(self.online_dir),
+            "pending_dir": str(self.pending_dir),
             "work": str(self.work),
             # the config field's name, so a reader of /admin/config can match it against the TOML;
             # "preview" is the same path under the name the rest of the API uses for the tree
             "preview_dir": str(self.preview),
             "preview": str(self.preview),
+            # the third tree: the review copy of the published content plus the frozen candidates.
+            # The field name, the key the API uses, and its build output, exactly like the
+            # preview triple.
+            "onlinepreview_dir": str(self.onlinepreview),
+            "onlinepreview": str(self.onlinepreview),
+            "onlinepreview_output": str(self.onlinepreview_output_dir),
             "output": str(self.output_dir),
             "repo_url": self.repo_url,
+            "remote_configured": self.has_remote,
             "branch": self.branch,
             "remote_name": self.remote_name,
             "recipe": self.recipe.to_dict(),
@@ -345,8 +381,11 @@ class Config:
     toml_keys: frozenset[str] = frozenset()
     #: The site table in force, as pushed or written; reused when only globals are pushed.
     site_raw: Mapping[str, Any] | None = None
-    #: Where ``effective.json`` is read from and written to: the TOML's ``state_dir``, never a
-    #: pushed one - a pushed ``state_dir`` may not move the very file that carries the push.
+    #: Where the **bootstrap state** is read from and written to: the TOML's ``state_dir``, never a
+    #: pushed one - a pushed ``state_dir`` may not move the very files that carry the push, and the
+    #: reset marker / pairing code / ``effective.json`` are all read before (or without) a pushed
+    #: configuration. The **business state** (``state.json`` and the build log) follows
+    #: :attr:`state_dir` and therefore moves with a push, which is the intended effect.
     bootstrap_state_dir: Path = Path("/var/lib/pages/state")
     #: The listen address from the config file itself, used when a pushed one cannot be bound.
     fallback_listen_host: str = "127.0.0.1"
@@ -354,6 +393,7 @@ class Config:
 
 
 def _as_str_tuple(value: Any, what: str) -> tuple[str, ...] | None:
+    """One config value that may be a string or an array of strings; ``None`` when it is absent."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -652,6 +692,35 @@ def effective_globals(cfg: "Config") -> dict[str, Any]:
     return values
 
 
+#: One-shot report of a pushed ``state_dir``: the settings page pushes the same configuration over
+#: and over, so the operator gets the explanation once per process and directory pair.
+_STATE_DIR_SPLIT_REPORTED: set[tuple[str, str]] = set()
+
+
+def note_bootstrap_split(cfg: "Config") -> bool:
+    """Log once that a push moved ``state_dir`` away from the TOML's; return whether it did.
+
+    A pushed ``state_dir`` moves the *business* state (``state.json`` and the build log) - that is
+    what the push is for. The *bootstrap* state stays in the TOML's directory, because the bridge
+    reads it before it knows about any push (or, after a reset, without the pushed file at all).
+    Explaining the split once keeps an operator from looking for ``effective.json`` under the pushed
+    path.
+    """
+    if cfg.bootstrap_state_dir == cfg.state_dir:
+        return False
+    key = (str(cfg.bootstrap_state_dir), str(cfg.state_dir))
+    if key in _STATE_DIR_SPLIT_REPORTED:
+        return True
+    _STATE_DIR_SPLIT_REPORTED.add(key)
+    info(
+        "the app pushed another state_dir; the bootstrap files stay where the TOML points",
+        bootstrap_state_dir=str(cfg.bootstrap_state_dir),
+        state_dir=str(cfg.state_dir),
+        bootstrap_files=[EFFECTIVE_FILE, UNPAIRED_FLAG, "pairing.json"],
+    )
+    return True
+
+
 def _site_table(raw: Mapping[str, Any]) -> Mapping[str, Any] | None:
     """The single ``[site]`` table.
 
@@ -710,7 +779,9 @@ def assemble_config(
         info("bridge is listening on a non-loopback address", host=host, hint="put HTTPS and authentication in front")
 
     nc_data_root = norm_abs(raw.get("nc_data_root", DEFAULT_NC_DATA_ROOT))
-    # the work copy is a disposable build cache under /tmp; the source of truth is always Nextcloud
+    # The three host trees are derived from the Nextcloud site folder; the commit tree is the git
+    # working tree a publish commits from, so it defaults into the same persistent root as
+    # state/overrides/logs, and its siblings (``.preview``, ``.onlinepreview``) inherit that root.
     work_root = norm_abs(raw.get("work_root", DEFAULT_WORK_ROOT))
     state_dir = norm_abs(raw.get("state_dir", DEFAULT_STATE_DIR))
     override_dir = norm_abs(raw.get("override_dir", DEFAULT_OVERRIDE_DIR))
@@ -733,7 +804,7 @@ def assemble_config(
         if paired and not allow_missing_site:
             raise ConfigError(
                 "the [site] table is required",
-                hint="the app pushes the site config on its own; re-run bridge/install.sh for a [site] seed",
+                hint="the app pushes the site config on its own; add a [site] block to the TOML by hand, then restart",
             )
         # unpaired, or paired by the app which pushes the site as well: nothing to build yet
         info("no site configured yet, the Nextcloud app pushes one when it pairs")
@@ -795,23 +866,17 @@ def _author_target_error(
     author_root: str = AUTHOR_ROOT_DEFAULT,
     previous_author_root: str | None = None,
 ) -> BridgeError:
-    """One message for "not an allowed target", listing every shape that is allowed."""
+    """One message for "not an allowed target", listing every directory an entry may live under."""
     allowed = [f"{author_root}/{uid}/..."]
     if previous_author_root is not None and previous_author_root != author_root:
         allowed.append(f"{previous_author_root}/{uid}/...")
-    allowed += [
-        f"{AUTHOR_POST_PREFIX}/{uid}/...",
-        f"{AUTHOR_ASSET_DIR}/{uid}.css",
-        f"{AUTHOR_ASSET_DIR}/{uid}/<slug>.css",
-    ]
 
     return error(
         f"{where} is not an allowed target",
         target=target,
         uid=uid,
         allowed=allowed,
-        hint="an author source may only write its own directory in the site (and, from older "
-             "versions, its own posts and its own stylesheet)",
+        hint="an author source may only write its own directory in the site",
     )
 
 
@@ -851,7 +916,7 @@ def _parse_entries(
         if not isinstance(target_raw, str) or not target_raw.strip():
             raise error(
                 f"{entry_where}.target is required",
-                hint=f"a site path, e.g. {AUTHOR_POST_PREFIX}/{uid}/2026-05-01-hello.md",
+                hint=f"a site path, e.g. {author_root}/{uid}/2026-05-01-hello.md",
             )
         target = target_raw.strip()
         if _clean_relative(target) is None:
@@ -1089,16 +1154,59 @@ def build_site(
 
     source = norm_abs(nc_data_root / nc_user / "files" / nc_path.strip("/"))
 
+    # The three fixed subdirectories of a site folder. They are derived, never configured: the
+    # administrator edits ``source/`` in Nextcloud, the bridge maintains ``online/`` (published
+    # content) and ``pending/`` (frozen candidates) through the ordinary file operations it is
+    # allowed to do as root. ``source/`` is the one required input - without it the assembly would
+    # silently rebuild three empty trees - while the two data directories are created on demand.
+    source_dir = norm_abs(source / "source")
+    online_dir = norm_abs(source / "online")
+    pending_dir = norm_abs(source / "pending")
+    if not source_dir.is_dir():
+        raise error(
+            "the site source directory does not exist",
+            source_dir=str(source_dir),
+            source=str(source),
+            hint=f"create {source_dir.name}/ inside the site folder; it holds the Jekyll skeleton the "
+                 "bridge assembles the three trees from",
+        )
+    for directory in (online_dir, pending_dir):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise error(
+                "the site directory could not be created",
+                path=str(directory),
+                detail=str(exc),
+                hint="the bridge runs as the Nextcloud file owner (root by default) and writes "
+                     "online/ and pending/ itself",
+            ) from exc
+    for directory in (source_dir, online_dir, pending_dir):
+        if not is_within(directory, nc_data_root):
+            raise error(
+                "the site directories must live inside the Nextcloud data directory",
+                path=str(directory),
+                nc_data_root=str(nc_data_root),
+            )
+    for left, right in ((source_dir, online_dir), (source_dir, pending_dir), (online_dir, pending_dir)):
+        if is_within(left, right) or is_within(right, left):
+            raise error(
+                "the three site directories must not contain each other",
+                left=str(left),
+                right=str(right),
+            )
+
     # single site: without an explicit work_path the work root itself is the work copy
     work_raw = str(raw.get("work_path", "")).strip()
     work = norm_abs(work_raw) if work_raw else norm_abs(work_root)
     if not work.is_absolute():
         raise ConfigError("work_path must be an absolute path", work=str(work))
 
-    # The preview tree: a second directory holding every author file (internal and external alike),
-    # which is built and served as the preview. Without a pushed value it is a sibling of the work
-    # copy - ``<work>.preview``, i.e. ``<work_root>.preview`` for the single-site default - so it can
-    # never land inside the work copy by accident.
+    # The preview tree: a **derived** directory holding every author file (internal and external
+    # alike), which is built and served as the preview and may be deleted/rebuilt from the sources
+    # alone. Without a pushed value it is a sibling of the work copy - ``<work>.preview``, i.e.
+    # ``<work_root>.preview`` for the single-site default - so it can never land inside the work
+    # copy by accident and always sits in the same root as the data it is derived from.
     preview_raw = raw.get("preview_dir")
     if preview_raw is None:
         preview = norm_abs(work.parent / f"{work.name}.preview")
@@ -1116,6 +1224,29 @@ def build_site(
                 hint=f"the default is {work.parent / (work.name + '.preview')}",
             )
         preview = norm_abs(text)
+
+    # The review tree: the **published** content plus the pending candidate snapshots, built and
+    # served as the reviewer's preview. It is data like the work copy (a pending candidate is the
+    # only copy of what the reviewer is looking at), so it is a sibling of the work copy by default
+    # - ``<work>.onlinepreview`` - in the same root as the data it mirrors, and an explicit value
+    # must be a usable absolute path.
+    onlinepreview_raw = raw.get("onlinepreview_dir")
+    if onlinepreview_raw is None:
+        onlinepreview = norm_abs(work.parent / f"{work.name}.onlinepreview")
+    else:
+        if not isinstance(onlinepreview_raw, str) or not onlinepreview_raw.strip():
+            raise error(
+                "site.onlinepreview_dir must be a non-empty absolute path",
+                got=repr(onlinepreview_raw)[:200],
+            )
+        text = onlinepreview_raw.strip()
+        if not Path(text).expanduser().is_absolute():
+            raise error(
+                "site.onlinepreview_dir must be an absolute path",
+                got=text,
+                hint=f"the default is {work.parent / (work.name + '.onlinepreview')}",
+            )
+        onlinepreview = norm_abs(text)
 
     # The two trees are separate on purpose: the preview holds everything, the commit tree only what
     # is on the site. Anything that makes one contain the other turns the split back into one tree.
@@ -1138,6 +1269,37 @@ def build_site(
             nc_data_root=str(nc_data_root),
         )
 
+    # The review tree is the third copy and has to stay separate from every other one: it is
+    # mirrored from the source, written by the candidate deltas and built on its own, so containing
+    # (or being contained by) the work copy, the preview or the source would make the three trees
+    # one directory again - or make a skeleton round delete the candidates.
+    if is_within(onlinepreview, work) or is_within(work, onlinepreview):
+        raise error(
+            "site.onlinepreview_dir must not be inside the work copy (the two directories must be separate)",
+            onlinepreview=str(onlinepreview),
+            work=str(work),
+        )
+    if is_within(onlinepreview, preview) or is_within(preview, onlinepreview):
+        raise error(
+            "site.onlinepreview_dir must not be inside the preview directory (the two directories must be separate)",
+            onlinepreview=str(onlinepreview),
+            preview=str(preview),
+        )
+    if is_within(onlinepreview, source) or is_within(source, onlinepreview):
+        raise error(
+            "source and onlinepreview directory must not contain each other (the mirror would recurse or delete itself)",
+            source=str(source),
+            onlinepreview=str(onlinepreview),
+        )
+    if is_within(onlinepreview, nc_data_root):
+        # the same rule the preview has: a skeleton round must never write into Nextcloud's data
+        # directory (and no author's folder may receive the site's own files)
+        raise error(
+            "onlinepreview directory must not live inside the Nextcloud data directory",
+            onlinepreview=str(onlinepreview),
+            nc_data_root=str(nc_data_root),
+        )
+
     # the source directory and the work copy must never contain each other
     if is_within(work, source) or is_within(source, work):
         raise ConfigError(
@@ -1152,9 +1314,9 @@ def build_site(
             nc_data_root=str(nc_data_root),
         )
 
+    # The remote is optional: a publish is the commit itself, so a site without a remote is a
+    # supported state ("commit only"), not a misconfiguration.
     repo_url = str(raw.get("repo_url", "")).strip()
-    if not repo_url:
-        raise ConfigError("repo_url is required")
 
     recipe = resolve_recipe(raw.get("recipe", {}) or {})
 
@@ -1166,8 +1328,12 @@ def build_site(
 
     return Site(
         source=source,
+        source_dir=source_dir,
+        online_dir=online_dir,
+        pending_dir=pending_dir,
         work=work,
         preview=preview,
+        onlinepreview=onlinepreview,
         repo_url=repo_url,
         branch=str(raw.get("branch", "main")),
         remote_name=str(raw.get("remote_name", "origin")),
@@ -1208,10 +1374,12 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError("config file is not valid TOML", path=str(cfg_path), detail=str(exc)) from exc
     toml_raw = dict(toml_raw)
 
-    # effective.json is looked up where the TOML says, never where a pushed value says: otherwise a
-    # pushed state_dir would move the very file that carries the push and the config would be lost
-    state_dir = norm_abs(toml_raw.get("state_dir", DEFAULT_STATE_DIR))
-    effective_path = state_dir / EFFECTIVE_FILE
+    # Bootstrap state is looked up where the TOML says, never where a pushed value says: otherwise a
+    # pushed state_dir would move the very files that tell the bridge whether it is paired or reset,
+    # and the config itself would be lost. `bootstrap_state_dir` is the same value assemble_config
+    # records on the Config, so the running server finds these files where this function reads them.
+    bootstrap_state_dir = norm_abs(toml_raw.get("state_dir", DEFAULT_STATE_DIR))
+    effective_path = bootstrap_state_dir / EFFECTIVE_FILE
 
     merged: dict[str, Any] = dict(toml_raw)
     app_globals: dict[str, Any] = {}
@@ -1250,6 +1418,32 @@ def load_config(path: str | Path) -> Config:
             # the app owns the config: a site may still be on its way, and the app pushes it
             allow_missing_site = bool(pushed["secrets"])
             info("loaded the config pushed by the app", revision=revision, keys=sorted(app_globals))
+
+    # The reset marker is bootstrap state too: POST /site/reset writes it before any push can move
+    # state_dir, and this check runs before the pushed site is adopted. It therefore lives in the
+    # TOML's directory. For backward compatibility a marker an older bridge left in the pushed
+    # state_dir is still honoured (the effective value is only known once effective.json parsed);
+    # the TOML's own location is checked first, so the bootstrap file always wins.
+    effective_state_dir = norm_abs(merged.get("state_dir", DEFAULT_STATE_DIR))
+    reset_flag: Path | None = None
+    for directory in dict.fromkeys((bootstrap_state_dir, effective_state_dir)):
+        if (directory / UNPAIRED_FLAG).is_file():
+            reset_flag = directory / UNPAIRED_FLAG
+            break
+    if reset_flag is not None:
+        # POST /site/reset wrote this marker: the TOML may still carry secrets and a site table
+        # (the example install.sh copies has neither, but a hand-written config can have both), and
+        # without the marker the next start would quietly pair the bridge with them again. A
+        # successful POST /pair clears it, so the reset survives a restart but pairing can
+        # re-establish the bridge.
+        info(
+            "the bridge was reset; ignoring the TOML secrets and site until it is paired again",
+            marker=str(reset_flag),
+        )
+        merged = dict(toml_raw)
+        for key in ("site", "sites", *SECRET_KEYS):
+            merged.pop(key, None)
+        return assemble_config(merged, toml_raw=toml_raw)
 
     if config_source == "app":
         try:

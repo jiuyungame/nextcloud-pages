@@ -24,7 +24,7 @@ use OCP\IUserSession;
  * reviewer/publisher may always author their own posts. Only booleans leave the server, never a group
  * id.
  *
- * `review` and `publish` are the same grant since the merge (see PermissionMigration). Both keys stay
+ * `review` and `publish` are the same grant since the merge (审核与发布). Both keys stay
  * in the payload - a client that gates a publish control on `publish` keeps working - and they are
  * computed from the same list, so they cannot disagree.
  */

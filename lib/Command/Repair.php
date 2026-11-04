@@ -6,6 +6,7 @@ namespace OCA\Pages\Command;
 
 use OCA\Pages\Service\ArticleIndexService;
 use OCA\Pages\Service\AuthorAreaService;
+use OCA\Pages\Service\AuthorDeltaService;
 use OCA\Pages\Service\AuthorSourcesService;
 use OCA\Pages\Service\BridgeClient;
 use OCA\Pages\Service\BridgeException;
@@ -23,11 +24,12 @@ use Symfony\Component\Console\Output\OutputInterface;
  *
  *  1. the **article rows** — a cache over the author files, written by the save path through
  *     {@see ArticleIndexService::register()}; a file that arrived some other way (the Files app, a sync
- *     client, a restored backup) has no row and is therefore missing from every list. The scan walks the
- *     same entry list a push walks ({@see AuthorSourcesService::scan()}) and registers each file.
- *  2. the **mirror target lists** — what the last accepted push handed to the bridge, written only after
- *     the bridge accepted it; an interrupted save leaves them behind, and the next push would then
- *     neither add nor remove the file. Re-pushing recomputes them from what is really there.
+ *     client, a restored backup) has no row and is therefore missing from every list. The scan walks
+ *     every author area ({@see AuthorSourcesService::scan()}) and registers each file.
+ *  2. the **site configuration** — the push an explicit save or `occ pages:push` would make. Author
+ *     content no longer travels with it, so the command re-runs the one-shot author overwrite
+ *     right here instead of waiting for the next boot: the preview tree's author area is rebuilt
+ *     from the scan (the commit tree's author area is `online/`, which the overwrite never touches).
  *  3. the **preview tree** — the bridge's build output; a forced build regenerates it, which is the only
  *     "rebuild marker" there is (the bridge owns the tree, the app only asks).
  *
@@ -41,6 +43,7 @@ class Repair extends Command
         private BridgeClient $bridge,
         private AuthorSourcesService $authorSources,
         private ArticleIndexService $index,
+        private AuthorDeltaService $delta,
     ) {
         parent::__construct();
     }
@@ -48,7 +51,7 @@ class Repair extends Command
     protected function configure(): void
     {
         $this->setName('pages:repair')
-            ->setDescription('Re-derive the article index, the mirror target lists and the preview tree (exit 2 = bridge unreachable)');
+            ->setDescription('Re-derive the article index, re-sync the author trees to the bridge and rebuild the preview tree (exit 2 = bridge unreachable)');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -82,12 +85,11 @@ class Repair extends Command
             $output->writeln(sprintf('<error>author area %s could not be read: %s</error>', (string)$uid, $message));
         }
 
-        // ---- 2. the mirror: re-push what the areas really hold, which recomputes both target lists ----
-        $pending = $this->authorSources->pending($scan);
+        // ---- 2. the bridge: re-push the site configuration, then re-run the one-shot author
+        //      overwrite right here (the boot runs it only once) ----
         $output->writeln(sprintf(
-            '<info>mirror</info> %d target(s) the bridge has not been told about, %d target(s) it still holds from an earlier push',
-            $pending['added'],
-            $pending['removed'],
+            '<info>author content</info> %d file(s) scanned; the bridge is repaired by the one-shot author overwrite',
+            count($scan['entries']),
         ));
         try {
             $pushed = $this->authorSources->pushWithAuthors($this->bridge);
@@ -113,6 +115,15 @@ class Repair extends Command
         ));
         foreach (($pushed['errors'] ?? []) as $uid => $message) {
             $output->writeln(sprintf('<comment>author %s could not be read: %s</comment>', (string)$uid, (string)$message));
+        }
+
+        // the one-shot flag is forgotten first, so the overwrite really runs (a boot may have set it);
+        // a failure keeps the flag unset and is retried on the next boot
+        $this->delta->forgetOverwrite();
+        if ($this->delta->overwrite()) {
+            $output->writeln('<info>author overwrite delivered</info> the bridge rebuilt the preview tree\'s author area');
+        } else {
+            $output->writeln('<comment>author overwrite not delivered</comment> it will be retried on the next request or boot');
         }
 
         // ---- 3. the preview tree: the bridge rebuilds it, a forced build is the marker ----

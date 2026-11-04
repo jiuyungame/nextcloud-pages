@@ -7,15 +7,17 @@ namespace OCA\Pages\Controller;
 use OCA\Pages\AppInfo\Application;
 use OCP\AppFramework\Http\Attribute\NoAdminRequired;
 use OCP\AppFramework\Http\Attribute\NoCSRFRequired;
-use OCP\AppFramework\Http\RedirectResponse;
 use OCP\AppFramework\Http\TemplateResponse;
 use OCP\IGroupManager;
 use OCP\IL10N;
 use OCP\IRequest;
-use OCP\IURLGenerator;
 use OCP\IUserSession;
 use OCP\Util;
 
+/**
+ * The app's one page and its shell. The shell trims what a non-administrator receives, while every
+ * action behind it is gated per endpoint (see BaseController).
+ */
 class PageController extends BaseController
 {
     public function __construct(
@@ -26,13 +28,13 @@ class PageController extends BaseController
         \OCA\Pages\Service\FileService $files,
         \OCA\Pages\Service\BridgeClient $bridge,
         IL10N $l10n,
-        private IURLGenerator $urlGenerator,
     ) {
         parent::__construct(Application::APP_ID, $request, $userSession, $groupManager, $registry, $files, $bridge, $l10n);
     }
 
     /**
-     * The **content** page: articles, review and reading, for every signed-in user.
+     * The **one** page: the caller's own articles, the visibility requests, reading, and the publish
+     * control for whoever holds the review-and-publish grant.
      *
      * #[NoCSRFRequired] is required: a bare GET from the app menu carries no requesttoken.
      * #[NoAdminRequired] because the shell itself needs no capability: the preview is open to every
@@ -42,32 +44,10 @@ class PageController extends BaseController
     #[NoAdminRequired]
     public function index(): TemplateResponse
     {
-        return $this->shell('content');
+        return $this->shell();
     }
 
-    /**
-     * The **site source** page: the Jekyll tree, the whole-file editor and build/publish — the work of
-     * a publisher, which is the review grant now (审核与发布), and nothing else.
-     *
-     * Somebody without the grant is sent back to the content page instead of being shown a shell
-     * whose every control would be refused by the server.
-     */
-    #[NoCSRFRequired]
-    #[NoAdminRequired]
-    public function source(): TemplateResponse|RedirectResponse
-    {
-        if (!$this->canReview()) {
-            return new RedirectResponse($this->urlGenerator->linkToRoute('pages.page.index'));
-        }
-
-        return $this->shell('source');
-    }
-
-    /**
-     * Both pages are the same application with the same state; only the page they start on differs, so
-     * the front end never has to guess which half it is.
-     */
-    private function shell(string $page): TemplateResponse
+    private function shell(): TemplateResponse
     {
         // pages-boot registers the error handler before pages-main loads
         Util::addScript(Application::APP_ID, 'pages-boot');
@@ -80,9 +60,9 @@ class PageController extends BaseController
         $isAdmin = $this->isAdmin();
         $site = $this->registry->getSite();
         $identity = [
-            'page' => $page,
-            // who is asking: the front end needs it to tell "my own entry" from somebody else's (a
-            // reviewer cannot decide about their own request, so the row has to know whose it is)
+            // who is asking: the front end needs it to tell "my own entry" from somebody else's so a
+            // row can say whose it is (the decision rules do not look at the owner: a reviewer may
+            // decide about any entry, their own included, and `decidedBy` records who answered)
             'uid' => (string)($this->userSession->getUser()?->getUID() ?? ''),
             // the capabilities the front end gates on; `canEdit` and `canPublish` are kept as the names
             // the pages already use, and both are the review grant now (审核与发布, see
@@ -92,9 +72,6 @@ class PageController extends BaseController
             'canEdit' => $this->canEdit(),
             'canPublish' => $this->canReview(),
             'isAdmin' => $isAdmin,
-            // the two pages link to each other, so neither has to build a URL by hand
-            'contentUrl' => $this->urlGenerator->linkToRoute('pages.page.index'),
-            'sourceUrl' => $this->urlGenerator->linkToRoute('pages.page.source'),
         ];
 
         if (!$isAdmin) {

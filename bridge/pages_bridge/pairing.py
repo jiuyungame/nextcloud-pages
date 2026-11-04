@@ -1,10 +1,15 @@
 """One-time pairing codes (``state_dir/pairing.json``) for the UNPAIRED state.
 
-A bridge without secrets is useless but reachable: it answers only ``GET /health`` and
-``POST /pair`` on a loopback address. ``bridge/install.sh`` prints one code, the administrator types
-it into the Nextcloud Pages settings, and the app sends both secrets plus the data directory in a
-single request. The code is a bearer credential for exactly one write, so it is short-lived,
-single-use and dies after three wrong attempts.
+A bridge without secrets is useless but reachable: it answers only ``GET /health``, ``POST /pair``
+and the idempotent ``POST /site/reset`` answer, on a loopback address. ``bridge/install.sh`` prints
+one code, the administrator types it into the Nextcloud Pages settings, and the app sends both
+secrets plus the data directory in a single request. The code is a bearer credential for exactly one
+write, so it is short-lived, single-use and dies after three wrong attempts.
+
+The ``state_dir`` every function here takes is the **bootstrap** one (the TOML's, see
+:attr:`pages_bridge.config.Config.bootstrap_state_dir`): the command that issues a code reads the TOML
+before any push exists, so the daemon must check the same directory or a freshly printed code would
+answer ``CODE_EXPIRED``.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ MODE = 0o600
 
 
 def pairing_path(state_dir: str | Path) -> Path:
-    """The code file of this bridge; ``state_dir`` is the effective one from the configuration."""
+    """The code file of this bridge; ``state_dir`` is the bootstrap one (the TOML's)."""
     return Path(state_dir) / "pairing.json"
 
 

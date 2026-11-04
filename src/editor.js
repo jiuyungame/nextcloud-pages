@@ -1,6 +1,6 @@
 /**
  * CodeMirror 6 wrapper, deliberately a standalone module: it only exposes
- * `{ requestMeasure, setDoc, getDoc, setPath, focus, destroy }`.
+ * `{ requestMeasure, setDoc, getDoc, setPath, setReadOnly, focus, destroy }`.
  */
 import { basicSetup } from 'codemirror'
 import { EditorView, keymap } from '@codemirror/view'

@@ -25,31 +25,17 @@ async function call(promise) {
 
 /*
  * Single-site design: there is exactly one site, so no call site carries a site id any more
- * (the id is not part of the API, the URL, or the stored configuration).
+ * (the id is not part of the API, the URL, or the stored configuration). The settings page
+ * (src/admin.js) talks to the admin endpoints with axios directly; this module is the
+ * author-facing surface.
  */
 export const api = {
-	site: () => call(axios.get(base('/api/site'))),
-
-	/** Save the single site (admin only; the body is the site object itself, without id/name) */
-	saveSite: (site) => call(axios.put(base('/api/site'), site)),
-
-	/** First git pull / fetch from the remote: the bridge does both, only it can run git */
-	init: () => call(axios.post(base('/api/site/init'))),
-	pull: () => call(axios.post(base('/api/site/pull'))),
-
 	/**
-	 * The file tree of one scope. The scope is what the caller is looking at: `author` is the
-	 * caller's own author area (the content page's column, for every user - the site's storage user
-	 * and an administrator included), `site` is the whole site source (the source page). One scope
-	 * never falls back to the other; the answer says which one it is and, for an author area, carries
-	 * the `target_prefix` its nodes are built on.
+	 * The file tree of the caller's own author area: the column of the one page this app has, for
+	 * every user - the site's storage user and an administrator included. Its nodes carry the site
+	 * `target` every file and article endpoint takes, and the `target_prefix` they are built on.
 	 */
-	tree: (scope = '') => call(axios.get(base('/api/site/tree'), scope ? { params: { scope } } : {})),
-
-	readFile: (path) => call(axios.get(base('/api/site/file'), { params: { path } })),
-
-	writeFile: (path, content, baseEtag) =>
-		call(axios.put(base('/api/site/file'), { path, content, baseEtag })),
+	tree: () => call(axios.get(base('/api/site/tree'), { params: { scope: 'author' } })),
 
 	/**
 	 * The same write for bytes: an image or another resource of the author's area is replaced
@@ -68,12 +54,22 @@ export const api = {
 	move: (from, to) =>
 		call(axios.post(base('/api/site/move'), { from, to })),
 
-	deleteFile: (path) =>
-		call(axios.delete(base('/api/site/file'), { params: { path } })),
+	/**
+	 * Delete one file or folder of the caller's author area.
+	 *
+	 * `mode` is what a deletion of a *published* file has to answer: `''` (or absent) deletes the file
+	 * only, `'request-offline'` deletes it and files a take-off request that waits for a reviewer, and
+	 * `'keep'` deletes it and hands the page to the orphan owner directory at once. The server ignores
+	 * the two workflows for a folder or an entry the site is not serving and answers
+	 * `mode_applied: false` with the reason, so a caller may send a mode unconditionally.
+	 *
+	 * @param {string} path the target of the file or folder
+	 * @param {''|'request-offline'|'keep'} [mode] what the online page should do with it
+	 */
+	deleteFile: (path, mode = '') =>
+		call(axios.delete(base('/api/site/file'), { params: { path, mode } })),
 
 	status: () => call(axios.get(base('/api/site/status'))),
-	build: () => call(axios.post(base('/api/site/build'))),
-	diff: () => call(axios.get(base('/api/site/diff'))),
 	publish: (message) =>
 		call(axios.post(base('/api/site/publish'), { message })),
 
@@ -91,9 +87,6 @@ export const api = {
 	 * Articles and the visibility workflow. An article is addressed by its **target** — the path it has
 	 * in the published site (`<author_root>/<uid>/<file>`) — and not by a file path inside the site folder.
 	 */
-
-	/** The caller's own articles, internal ones included */
-	myArticles: () => call(axios.get(base('/api/articles/mine'))),
 
 	/*
 	 * The reading side: every article of the site, plus the community data around one of them. Reading
@@ -127,12 +120,19 @@ export const api = {
 	vote: (path, vote) => call(axios.post(base('/api/article/vote'), { path, vote })),
 
 	/*
-	 * The visibility workflow: a page is internal until a reviewer approves it for the site. Exactly
-	 * three actions - ask (request), withdraw (cancel) and the reviewer's answer (decision) - plus the
-	 * list of pending requests, which is the article list filtered to `state=requested`.
+	 * The visibility workflow of the snapshot model: an entry is internal until a reviewer approves a
+	 * frozen candidate for the site. The author asks (request), withdraws (cancel) and the reviewer
+	 * answers (decision); a reviewer with nothing pending takes a served page down with its own
+	 * endpoint (take-down), because a decision would be a 409 there.
 	 */
 
-	/** @param {string} path article target @param {'online'|'offline'} intent the direction asked for */
+	/**
+	 * Ask for the entry to go online (`online`, which on a served entry means an update of its
+	 * content) or off it (`offline`). The server freezes a candidate snapshot for `online`; a pending
+	 * request answers 409.
+	 *
+	 * @param {string} path article target @param {'online'|'offline'} intent the direction asked for
+	 */
 	requestVisibility: (path, intent) =>
 		call(axios.post(base('/api/article/request'), { path, intent })),
 
@@ -140,21 +140,47 @@ export const api = {
 	cancelRequest: (path) => call(axios.post(base('/api/article/cancel'), { path })),
 
 	/**
+	 * Answer a pending request: `approve` publishes the candidate or carries out the take-off,
+	 * `reject` discards the candidate or declines the take-off (the served version stays).
+	 *
 	 * @param {string} path article target
-	 * @param {'approve'|'reject'} decision `approve` applies the intent, `reject` returns to internal
+	 * @param {'approve'|'reject'} decision
 	 * @param {string} [note] why a request was rejected; the author sees it
 	 */
 	decideRequest: (path, decision, note = '') =>
 		call(axios.post(base('/api/article/decision'), { path, decision, note })),
 
-	/** The pending requests (every entry in `requested`), with their intent and note; 403 without the review grant */
+	/**
+	 * A reviewer takes a page the site serves off it, with nothing pending. A decision would be a
+	 * conflict on such an entry, which is why this is its own endpoint.
+	 *
+	 * @param {string} path article target
+	 * @param {string} [note] why the page was taken down; the author sees it
+	 */
+	takeDown: (path, note = '') =>
+		call(axios.post(base('/api/article/take-down'), { path, note })),
+
+	/**
+	 * The take-off requests: every entry in `requested`, which since the folders are the truth means
+	 * exactly one carrying a `downRequest`. 403 without the review grant.
+	 *
+	 * A candidate is not in this answer: the state is derived (`online/` → `external`, otherwise
+	 * `internal`), so a page waiting for a first publication or an update keeps its state and is read
+	 * with `awaitingArticles()` instead.
+	 */
 	visibilityRequests: () => call(axios.get(base('/api/articles'), { params: { state: 'requested' } })),
+
+	/**
+	 * The entries carrying a candidate in `pending/` (`?awaiting=1`): a first publication, or an
+	 * update of an entry the site already serves. The panel asks for this list and the take-off list
+	 * (`visibilityRequests()`) in parallel and merges them by target.
+	 */
+	awaitingArticles: () => call(axios.get(base('/api/articles'), { params: { awaiting: true } })),
 
 	/*
 	 * The structured article: the body without its front matter, plus the metadata as fields. This is
-	 * what the fields panel edits. `readFile`/`writeFile` above stay the raw whole-file path, which is
-	 * what every non-article file uses (layout, stylesheet, `_config.yml`) and what keeps those files
-	 * byte-exact.
+	 * what the fields panel edits; a file that is not an article is a resource of the author's area,
+	 * replaced as bytes or deleted, never edited as text.
 	 */
 
 	/** @param {string} path article target */

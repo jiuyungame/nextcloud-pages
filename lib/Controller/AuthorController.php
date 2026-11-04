@@ -40,9 +40,9 @@ class AuthorController extends BaseController
 
     /**
      * The author status table: `{"ok": true, "authors": [{uid, displayName, area, posts,
-     * missing, unpublished}]}`. `missing` holds targets whose source file is gone, so the next push
-     * deletes them from the site; `unpublished` counts the author's posts the app has not published
-     * yet.
+     * missing, unpublished}]}`. `missing` is always `[]`: the drift comparison that used to fill it is
+     * gone, and the field stays because the admin table reads it; `unpublished` counts the author's
+     * posts the app has not published yet.
      */
     #[NoAdminRequired]
     public function sources(): DataResponse

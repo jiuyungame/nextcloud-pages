@@ -7,13 +7,14 @@
 
 	Plain `<label>` + `<input>` rather than a component: Nextcloud's text field only renders its
 	`label-outside` variant in some versions, and a panel whose fields have no visible names is worse
-	than a plain one. The date, the tags and the file name share one row, the file name being what
-	fills the space the two small fields leave; the only read-only fact left (the address in the
-	built site) sits on a compact line below, because it is reference material, not a field.
+	than a plain one. The date, the tags, the layout and the categories share one row, wrapping when
+	the pane is narrow; the file name is not a field at all (it is the page's address, renamed inline
+	in the tree). The only read-only fact left (the address in the built site) sits on a compact line
+	below, because it is reference material, not a field.
 
-	Additional metadata: every front-matter key this panel does not own is shown in a compact
-	read-only table (five rows at most, with the number that was left out) and edited in an `NcDialog`
-	with one editable row per key. The dialog works on a copy: Cancel or Esc changes nothing, Save
+	Additional metadata: every front-matter key this panel does not own is reached through the "Edit
+	metadata" link beside the title and edited in an `NcDialog` with one editable row per key; the
+	panel shows no table of them. The dialog works on a copy: Cancel or Esc changes nothing, Save
 	emits the whole map and the app posts the delta with the next save (a row that was removed is sent
 	as an empty value, which is how the server deletes a key).
 
@@ -228,7 +229,7 @@ import { t } from './i18n.js'
 import { displayMetaValue, extrasOf, splitTarget } from './articles.js'
 import { isFutureDay } from './articleGeometry.js'
 
-/** How many additional-metadata rows the read-only table shows before it counts the rest. */
+/** How many additional-metadata rows a table showed before counting the rest; no such table is rendered now. */
 const EXTRA_TABLE_ROWS = 5
 
 /** The shape a new or changed row starts with, per type. */
@@ -283,7 +284,7 @@ export default {
 			return String(this.meta.permalink ?? '').trim()
 		},
 
-		/** The file name split into the parts a user may see: the date, the name and the extension. */
+		/** The file name split into the parts a rename field would edit: the day, the name and the extension. */
 		parts() {
 			return splitTarget(this.path)
 		},
@@ -300,7 +301,7 @@ export default {
 			return this.parts.ext
 		},
 
-		/** The unknown keys of the block, in the file's own order, with a value the table can show. */
+		/** The unknown keys of the block, in the file's own order, with a value printable as text. */
 		extraRows() {
 			return Object.entries(extrasOf(this.meta)).map(([key, value]) => ({
 				key,
@@ -371,7 +372,7 @@ export default {
 			return 'pages-field-' + name + '-' + String(this.path || 'article').replace(/[^a-zA-Z0-9]/g, '-')
 		},
 
-		/** @param {'title'|'date'|'tagsText'|'categoriesText'|'excerpt'|'fileName'} key @param {string} value */
+		/** @param {'title'|'date'|'tagsText'|'categoriesText'|'excerpt'|'extra'} key @param {string} value */
 		update(key, value) {
 			this.$emit('update', { key, value })
 		},
@@ -451,7 +452,7 @@ export default {
 
 		/**
 		 * Validate the rows and hand the whole map to the app, which merges it into the save. Nothing
-		 * is written here: a refused save is the app's banner, not a second error channel.
+		 * is written here: a refused save is the app's toast, not a second error channel.
 		 *
 		 * @returns {boolean} false keeps the dialog open (NcDialogButton convention)
 		 */
@@ -575,9 +576,8 @@ export default {
 }
 
 /*
- * The file name fills the free space of the date row. Its basis is deliberately smaller than that
- * space (about 600 px in the normal split at a 1500 px window), so the three fields stay on one line
- * there and only wrap once the pane is really narrow; growing then takes whatever is left.
+ * The rule of the removed file-name field: it took the free space of the date row. Unused now that
+ * the name is renamed in the tree, kept so the stylesheet still describes the row it was written for.
  */
 .pages-fields__field--name {
 	flex: 1 1 170px;
@@ -660,7 +660,7 @@ export default {
 	font-size: 11px;
 }
 
-/* the editable name sits between the fixed date prefix and the fixed extension */
+/* The name part of the removed file-name field: the fixed date prefix and extension around it. */
 .pages-fields__name {
 	display: flex;
 	align-items: center;
@@ -679,7 +679,7 @@ export default {
 	flex: 0 0 auto;
 }
 
-/* fills the free area of the row, so the name is as long as the space the tags left open */
+/* The input of the removed file-name field; unused, like the field itself. */
 .pages-fields__input--name {
 	flex: 1 1 auto;
 	font-family: var(--font-face-monospace, monospace);
@@ -694,7 +694,7 @@ export default {
 	color: var(--color-error-text, var(--color-error));
 }
 
-/* additional metadata: a compact two-column table, then the dialog behind the link */
+/* additional metadata: the table these rules styled is gone; the dialog is the only view of the keys */
 .pages-fields__extra {
 	display: flex;
 	flex-direction: column;
@@ -739,7 +739,7 @@ export default {
 	text-decoration: underline;
 }
 
-/* the dialog: one row per key, the same table shape as the panel */
+/* the dialog: one row per key, in the table shape the panel used to render */
 .pages-meta {
 	display: flex;
 	flex-direction: column;

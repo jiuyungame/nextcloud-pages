@@ -8,6 +8,7 @@ use OCP\IL10N;
 use OCP\IURLGenerator;
 use OCP\Settings\IIconSection;
 
+/** The Pages section of the admin settings sidebar; the panel it holds is {@see Admin}. */
 class AdminSection implements IIconSection
 {
     /** Constructor injection only: the old \OC::$server->getXxx() getters no longer exist. */

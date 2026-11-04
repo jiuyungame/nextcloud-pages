@@ -6,12 +6,13 @@ namespace OCA\Pages\Controller;
 
 use OCA\Pages\AppInfo\Application;
 use OCA\Pages\Service\ArticleIndexService;
-use OCA\Pages\Service\AuthorAreaService;
+use OCA\Pages\Service\AuthorDeltaService;
 use OCA\Pages\Service\BridgeClient;
 use OCA\Pages\Service\BridgeException;
 use OCA\Pages\Service\ConflictException;
 use OCA\Pages\Service\FileService;
 use OCA\Pages\Service\FrontMatter;
+use OCA\Pages\Service\OrphanTransfer;
 use OCA\Pages\Service\PageUrlService;
 use OCA\Pages\Service\ReviewStore;
 use OCA\Pages\Service\SiteRegistry;
@@ -23,23 +24,21 @@ use OCP\IGroupManager;
 use OCP\IL10N;
 use OCP\IRequest;
 use OCP\IUserSession;
+use OCP\Server;
 
 /**
- * File browsing and editing. Everything goes through FileService (Nextcloud Files API), so version
- * history, trash and desktop sync keep working; a successful save notifies the bridge to rebuild.
+ * File browsing and editing of an **author area**: a site target (`<author_root>/<uid>/…`), which every
+ * author addresses - the site's storage user and an administrator exactly like anybody else.
+ * Everything goes through FileService (Nextcloud Files API), so version history, trash and desktop sync
+ * keep working; a successful save notifies the bridge to rebuild the preview.
  *
- * Two shapes of the same operations, and the **path decides** which one a request is:
- *  - the **site tree**: a site-relative file path (`_config.yml`, `assets/…`), reachable with the
- *    publish grant. `GET /api/site/tree?scope=site` is its tree, and the source page is the one
- *    place it belongs;
- *  - the **author area**: a site target (`<author_root>/<uid>/…`), which every author addresses -
- *    the site's storage user and an administrator exactly like anybody else.
- *    `GET /api/site/tree?scope=author` is its tree, and the content page's column is where it
- *    belongs. A target that names another author is answered 403 by the mapper, so no endpoint here
- *    reaches a foreign folder.
+ * The site's own source folder is **not** edited here any more: its writers are the Files app /
+ * WebDAV, the tarball Import and the git Pull, and all of them replace it completely (see
+ * SiteController::importSource() and SiteController::pull()). A target that names another author is
+ * answered 403 by the mapper, so no endpoint here reaches a foreign folder.
  *
- * An author's files are pages of the site's template, never posts: the only rule that differs between
- * an author file and a site file is where it is rendered (see PageUrlService), not what it is.
+ * An author's files are pages of the site's template, never posts: the one rule is where a file is
+ * rendered (see PageUrlService), not what it is.
  */
 class BrowseController extends BaseController
 {
@@ -54,8 +53,10 @@ class BrowseController extends BaseController
 
     /**
      * A category name: lower-case letters, digits, underscore and hyphen - and every non-ASCII
-     * character, because a Chinese category is as valid a folder name as a Chinese slug is. The site
-     * then requires a page of that name at its root (see PageUrlService::isCategoryName()).
+     * character, because a Chinese category is as valid a folder name as a Chinese slug is. No slash,
+     * whatever the flavour: a category is one folder at the site root, one path segment, which is
+     * exactly what PageUrlService::isCategoryName() requires - the panel must not accept a name the
+     * site can never use.
      */
     private const CATEGORY_NAME = '/^[a-z0-9_\-\x{80}-\x{10FFFF}]+$/u';
 
@@ -74,6 +75,38 @@ class BrowseController extends BaseController
     private const META_EXTRA_KEY = '/^[a-z0-9_]+$/';
     private const META_EXTRA_KEY_MAX = 64;
 
+    /**
+     * What a delete does with a page the site serves (`mode` of DELETE /api/site/file):
+     *
+     *  - `''`               plain delete: the file and its manifest entry go; a page the site does
+     *                       not serve has no copy to take down or hand over, so nothing else
+     *                       follows.
+     *                       On a page the site **serves** this mode cannot be honoured - the page would
+     *                       stay online with nobody asked to take it down, and with the entry gone
+     *                       nothing could be decided about it any more - so it degrades to
+     *                       `request-offline` and the answer says `mode: 'request-offline'`,
+     *                       `reason: 'published'`.
+     *  - `request-offline`  the file goes, the entry stays: a `downRequest` with `sourceDeleted: true`
+     *                       is recorded, so a reviewer decides instead of the author (see
+     *                       ArticleReviewService::decide()).
+     *  - `keep`             the file goes and the published copy is handed over to the orphan owner
+     *                       right away (see OrphanTransfer).
+     *
+     * A file the site does not serve has nothing to take down or hand over: both modes degrade to a
+     * plain delete, and the answer says so (`reason: 'not-published'`).
+     *
+     * A **folder** has no single mode, because what has to be taken down is each of the pages inside
+     * it: every file of the folder the site still serves keeps its entry and gets a take-down request
+     * ({@see ReviewStore::requestTakeDownForDeletedSources()}, one write for the whole subtree), every
+     * other entry goes with the folder, and the answer reports the two counts with `mode_applied: false`
+     * and `reason: 'folder'`.
+     */
+    public const DELETE_MODE_OFFLINE = 'request-offline';
+    public const DELETE_MODE_KEEP = 'keep';
+    /** @var list<string> */
+    public const DELETE_MODES = [self::DELETE_MODE_OFFLINE, self::DELETE_MODE_KEEP];
+
+
     public function __construct(
         IRequest $request,
         IUserSession $userSession,
@@ -85,59 +118,25 @@ class BrowseController extends BaseController
         private ArticleIndexService $articleIndex,
         private PageUrlService $pageUrls,
         private ReviewStore $review,
+        private OrphanTransfer $orphanTransfer,
     ) {
         parent::__construct(Application::APP_ID, $request, $userSession, $groupManager, $registry, $files, $bridge, $l10n);
     }
 
     /**
-     * Every method here is gated inside the controller (siteContext), so the framework-level admin
-     * gate has to be lifted for the route to be reachable at all.
+     * The whole controller is authoring territory: the tree, the whole-file calls (read, write, create,
+     * delete, move, makeFolder) and the two article-editor calls all run the authoring gate
+     * (`author_groups`, see BaseController::requireAuthor()) before they touch a file, so a signed-in
+     * user outside the grant can neither list the tree nor reach the files behind it. The framework's
+     * admin gate is therefore lifted at the route level; the capability is checked here.
      */
     #[NoAdminRequired]
-    public function tree(string $scope = ''): DataResponse
+    public function tree(): DataResponse
     {
-        // Which tree the caller asked for. It is explicit because the two pages of this app show
-        // different things to the same user: the content page's column is always the caller's own
-        // author area (the site's storage user and an administrator included), the source page's is
-        // always the site. Without the parameter the answer is the caller's default - the site tree
-        // for a publisher, the own area otherwise - which is what a client written before it got.
-        $scope = strtolower(trim($scope));
-        if ($scope !== '' && $scope !== 'author' && $scope !== 'site') {
-            return new DataResponse(
-                ['error' => 'BAD_REQUEST', 'message' => $this->l10n->t('The scope must be author or site')],
-                400,
-            );
-        }
-
-        if ($scope === 'site' || ($scope === '' && $this->canEdit())) {
-            [$denied, $site, $userId] = $this->siteContext('edit');
-            if ($denied !== null) {
-                return $denied;
-            }
-            try {
-                $result = $this->files->tree($userId, (string)$site['nc_path']);
-                return new DataResponse([
-                    'source' => $site['nc_path'],
-                    'exists' => true,
-                    ...$result,
-                ]);
-            } catch (\Throwable $e) {
-                if ($this->files->siteExists($userId, (string)$site['nc_path']) === false) {
-                    // directory not created yet: "not initialised", not an error
-                    return new DataResponse([
-                        'source' => $site['nc_path'],
-                        'exists' => false,
-                        'nodes' => [],
-                        'truncated' => false,
-                        'hint' => $this->l10n->t('The site directory does not exist yet. Run init on the bridge first (it back-fills the working copy).'),
-                    ]);
-                }
-                return $this->translate($e) ?? throw $e;
-            }
-        }
-
-        // the author scope: the caller's own area is the whole world this answer may cover, for
-        // every caller - the storage user of the site and an administrator included
+        // The one tree of this app: the caller's own author area, for every caller - the site's
+        // storage user and an administrator included. The `scope` parameter left with the source
+        // page: a client that still sends it gets the same author tree, because that is the only
+        // tree this endpoint can describe.
         if (($missing = $this->requireSite()) !== null) {
             return $missing;
         }
@@ -187,6 +186,9 @@ class BrowseController extends BaseController
     #[NoAdminRequired]
     public function read(string $path = ''): DataResponse
     {
+        if (($author = $this->requireAuthor()) !== null) {
+            return $author;
+        }
         if ($this->isAuthorScoped($path)) {
             return $this->authorCall(function () use ($path): DataResponse {
                 $areas = $this->authorAreas();
@@ -201,15 +203,8 @@ class BrowseController extends BaseController
                 return new DataResponse([...$file, 'path' => $resolved['target'], 'owner' => $uid]);
             });
         }
-        [$denied, $site, $userId] = $this->siteContext('edit');
-        if ($denied !== null) {
-            return $denied;
-        }
-        try {
-            return new DataResponse($this->files->read($userId, (string)$site['nc_path'], $path));
-        } catch (\Throwable $e) {
-            return $this->translate($e) ?? throw $e;
-        }
+
+        return $this->notAnAuthorPath($path);
     }
 
     /**
@@ -223,6 +218,9 @@ class BrowseController extends BaseController
     #[NoAdminRequired]
     public function write(string $path = '', string $content = '', ?string $baseEtag = null): DataResponse
     {
+        if (($author = $this->requireAuthor()) !== null) {
+            return $author;
+        }
         $encoded = $this->request->getParam('contentBase64', null);
         if ($encoded !== null) {
             if (!is_string($encoded)) {
@@ -260,27 +258,8 @@ class BrowseController extends BaseController
                 ]);
             });
         }
-        [$denied, $site, $userId] = $this->siteContext('edit');
-        if ($denied !== null) {
-            return $denied;
-        }
-        try {
-            $result = $this->files->write(
-                $userId,
-                (string)$site['nc_path'],
-                $path,
-                $content,
-                $baseEtag,
-                false,
-            );
-        } catch (\Throwable $e) {
-            return $this->translate($e) ?? throw $e;
-        }
 
-        return new DataResponse([
-            ...$result,
-            'bridge' => $this->notifyBridge(),
-        ]);
+        return $this->notAnAuthorPath($path);
     }
 
     /**
@@ -295,6 +274,9 @@ class BrowseController extends BaseController
     #[NoAdminRequired]
     public function articleContent(): DataResponse
     {
+        if (($author = $this->requireAuthor()) !== null) {
+            return $author;
+        }
         try {
             $path = trim($this->textField('path') ?? '');
         } catch (\InvalidArgumentException $e) {
@@ -305,10 +287,9 @@ class BrowseController extends BaseController
         }
 
         // The path decides where the article is, the capability decides how far the caller reaches: a
-        // path that names an author area (`<author_root>/<uid>/…`, the retired `_posts/<uid>/…` too)
-        // is an article of that area, and a path that names nobody is a file of the site skeleton. An
-        // author is refused a skeleton path by the mapper (403, like the file endpoints); an editor
-        // reaches both.
+        // path that names an author area (`<author_root>/<uid>/…`) is an article of that area, and a
+        // path that names nobody is a file of the site skeleton. An author is refused a skeleton path
+        // by the mapper (403, like the file endpoints); an editor reaches both.
         if ($this->isAuthorScoped($path)) {
             return $this->authorCall(function () use ($path): DataResponse {
                 $areas = $this->authorAreas();
@@ -324,31 +305,13 @@ class BrowseController extends BaseController
             });
         }
 
-        $target = $this->articleTarget($path);
-        if ($target === null) {
-            return new DataResponse(
-                ['error' => 'BAD_REQUEST', 'message' => $this->l10n->t('Not an article path: %s', [$path])],
-                400,
-            );
-        }
-        [$denied, $site, $userId] = $this->siteContext('edit');
-        if ($denied !== null) {
-            return $denied;
-        }
-        try {
-            return new DataResponse($this->articleAnswer(
-                $target,
-                $this->files->read($userId, (string)$site['nc_path'], $target),
-            ));
-        } catch (\Throwable $e) {
-            return $this->translate($e) ?? throw $e;
-        }
+        return $this->notAnArticlePath($path);
     }
 
     /**
      * Saves an article: the body as sent plus the fields the client names.
      *
-     *   {"path": "/_posts/alice/2026-05-01-hello.md", "body": "…", "baseEtag": "…",
+     *   {"path": "/<author_root>/<uid>/2026-05-01-hello.md", "body": "…", "baseEtag": "…",
      *    "meta": {"title": "…", "tags": ["a","b"], "date": "2026-05-01", "excerpt": "…"}}
      *
      * The document is rebuilt on the server, from the file that is on disk: a key the request does not
@@ -364,6 +327,9 @@ class BrowseController extends BaseController
     #[NoAdminRequired]
     public function articleSave(): DataResponse
     {
+        if (($author = $this->requireAuthor()) !== null) {
+            return $author;
+        }
         try {
             $path = trim($this->textField('path') ?? '');
             if ($path === '') {
@@ -402,45 +368,31 @@ class BrowseController extends BaseController
                     $baseEtag,
                 );
                 // the bookkeeping an author's article needs on every save: the index has to know the
-                // article (a brand new author is only an author once the database says so), and the
-                // revision that was just replaced must not stay approved
+                // article (a brand new author is only an author once the database says so). The
+                // visibility state is left alone: an edit is not a review decision.
                 $this->registerArticle($article['uid'], $areas->area(), $article);
 
-                // the area is mirrored from the author sources, so the configuration has to travel again
-                // for the change to reach the working copy - whoever saved it
+                // the file change travels as a file-event delta; the call below refreshes the site
+                // configuration and asks the bridge to rebuild - whoever saved it
                 return new DataResponse([...$answer, 'bridge' => $this->syncAuthorSources()]);
             });
         }
 
-        $target = $this->articleTarget($path);
-        if ($target === null) {
-            return new DataResponse(
-                ['error' => 'BAD_REQUEST', 'message' => $this->l10n->t('Not an article path: %s', [$path])],
-                400,
-            );
-        }
-        [$denied, $site, $userId] = $this->siteContext('edit');
-        if ($denied !== null) {
-            return $denied;
-        }
-        try {
-            $answer = $this->saveArticle($userId, (string)$site['nc_path'], $target, $target, $set, $remove, $body, $baseEtag);
-        } catch (\Throwable $e) {
-            return $this->translate($e) ?? throw $e;
-        }
-
-        return new DataResponse([...$answer, 'bridge' => $this->notifyBridge()]);
+        return $this->notAnArticlePath($path);
     }
 
     /**
-     * Creates a file. Creation is the other way a name enters the site tree, so it is held to the same
+     * Creates a file. Creation is the other way a name enters an article, so it is held to the same
      * rule a move is (`nameDayNotAfterToday()`): the two entry points must not be able to disagree
-     * about a file the app then refuses to save. That rule is about the site's own `_posts/**` only -
-     * an author's file is a page, and a date in its name is a date in a name.
+     * about a file the app then refuses to save. That rule is about an author's target, whose file
+     * name may carry the article's date.
      */
     #[NoAdminRequired]
     public function create(string $path = '', string $content = ''): DataResponse
     {
+        if (($author = $this->requireAuthor()) !== null) {
+            return $author;
+        }
         if ($this->isAuthorScoped($path)) {
             return $this->authorCall(function () use ($path, $content): DataResponse {
                 $areas = $this->authorAreas();
@@ -474,39 +426,62 @@ class BrowseController extends BaseController
                 ]);
             });
         }
-        [$denied, $site, $userId] = $this->siteContext('edit');
-        if ($denied !== null) {
-            return $denied;
-        }
-        try {
-            $this->nameDayNotAfterToday($path);
-            $result = $this->files->write(
-                $userId,
-                (string)$site['nc_path'],
-                $path,
-                $content,
-                null,
-                true,
-            );
-        } catch (\Throwable $e) {
-            return $this->translate($e) ?? throw $e;
-        }
-        return new DataResponse([...$result, 'bridge' => $this->notifyBridge()]);
+
+        return $this->notAnAuthorPath($path);
     }
 
     /**
      * Deletes a file or a folder through Nextcloud's own delete, so the trash keeps a copy.
      *
-     * Deleting is direct - there is no reviewed deletion any more. What follows the delete is the
-     * bookkeeping: the manifest entry of a file goes with it (nothing is left to request), while the
-     * `published` list keeps the path, which is how the next publish learns to take the page off the
-     * site (see ArticleReviewService::classify()). A folder takes the entries of everything inside it.
+     * Deleting a file is direct - there is no reviewed deletion. What follows the delete depends on
+     * `mode`, and on whether the site is serving the file at all:
+     *
+     *  - `''` (default) plain delete. A pending request about the target is withdrawn
+     *    ({@see AuthorDeltaService::withdrawPending()}), the manifest entry goes with the file
+     *    ({@see self::forgetArticleEntry()}), and `online/<target>` keeps the page where it is, which
+     *    is how the next publish learns to take the page off the site. A folder is different - see
+     *    below.
+     *  - `request-offline` the file goes but the entry stays, with a fresh `downRequest` carrying
+     *    `sourceDeleted: true`: the author deleted what they asked to take down, so the reviewer's
+     *    refusal is no longer "keep the page up" - it transfers the published copy to the orphan owner
+     *    ({@see ArticleReviewService::decide()}).
+     *  - `keep` the file goes and the published copy is handed over immediately
+     *    ({@see OrphanTransfer}), so the page survives as the site's own file and no request is filed.
+     *
+     * Both non-empty modes need a page the site serves (`online/<target>`): a file without one has
+     * nothing to take down or hand over, so the mode is ignored and the answer says so
+     * (`mode_applied: false` with the reason). The delete itself always happens.
+     *
+     * A **folder** is settled file by file as far as the site is concerned: every file inside it that
+     * the site still serves keeps its entry and gets a `downRequest` with `sourceDeleted: true`
+     * ({@see self::requestTakeDownOfDeleted()}), because a reviewer's take-down is the only operation
+     * that clears `online/<target>` - the file event's `remove` delta drops the preview copy only. The
+     * entries the site does not serve go with the folder, and the answer names the two counts
+     * (`offline_requests`, `forgotten`), so a client can say "N pages wait to be taken down". A folder
+     * has nothing to hand over and no single mode: the `mode` is reported as not applied, whatever the
+     * caller sent.
+     *
+     * A plain delete of a file the site serves is the one combination that must not be carried out as
+     * asked: with the file gone and no request filed the page would stay online with no entry left to
+     * decide about (a reviewer's take-down answers 404 for it), i.e. permanently. It degrades to
+     * `request-offline` - the safe direction, which leaves the reviewer in charge - and the answer says
+     * `mode: 'request-offline'`, `mode_applied: true`, `reason: 'published'`.
      */
     #[NoAdminRequired]
-    public function delete(string $path = ''): DataResponse
+    public function delete(string $path = '', string $mode = ''): DataResponse
     {
+        if (($author = $this->requireAuthor()) !== null) {
+            return $author;
+        }
+        $mode = trim($mode);
+        if ($mode !== '' && !in_array($mode, self::DELETE_MODES, true)) {
+            return new DataResponse(
+                ['error' => 'BAD_REQUEST', 'message' => $this->l10n->t('Unknown delete mode: %s', [$mode])],
+                400,
+            );
+        }
         if ($this->isAuthorScoped($path)) {
-            return $this->authorCall(function () use ($path): DataResponse {
+            return $this->authorCall(function () use ($path, $mode): DataResponse {
                 $areas = $this->authorAreas();
                 $uid = $this->currentUserId();
                 $resolved = $areas->resolve($uid, $path);
@@ -514,33 +489,164 @@ class BrowseController extends BaseController
                 if ($deny !== null) {
                     return $this->authorDenied($deny, $path);
                 }
+                $target = (string)$resolved['target'];
+                // Every following decision about the site's copies comes from the content
+                // directories: whether the page is served (the mode) and whether a candidate still
+                // waits. The Files API fallback cannot prove either, and the file is deleted below -
+                // refusing here leaves everything as it was, so the author can retry.
+                $this->review->requireTrustedTrees();
                 $isFolder = $this->authorNodeIsFolder($uid, $areas->area(), (string)$resolved['file']);
-                $this->files->delete($uid, $areas->area(), (string)$resolved['file']);
-                // the entries under the deleted node go with it: nothing is left to request, and the
-                // next publish carries the removal of whatever the site still names
-                $bookkeeping = $isFolder
-                    ? $this->forgetAuthorEntries((string)$resolved['target'])
-                    : $this->forgetArticleEntry((string)$resolved['target']);
+                // the two facts the mode needs, read before the file is gone (the entry is the answer
+                // to "may this be taken down or handed over at all")
+                $published = !$isFolder && $this->review->isLive($target);
+                // why the answer's mode is not the one the caller asked for, '' while it is
+                $reason = null;
+                if ($mode === '' && $published) {
+                    // no mode, but the site serves the page: the plain delete would drop the entry and
+                    // leave the page online with nobody asked to take it down, so it becomes the
+                    // request that leaves the decision to a reviewer
+                    $mode = self::DELETE_MODE_OFFLINE;
+                    $reason = 'published';
+                }
 
-                return new DataResponse([
-                    'path' => $resolved['target'],
+                $this->files->delete($uid, $areas->area(), (string)$resolved['file']);
+                // the file is gone: whatever was waiting for a decision about it goes too, and the
+                // frozen review copy (if any) is discarded through the bridge. A mode that keeps the
+                // entry writes its own down request below, after this cleared the old one.
+                $this->authorDeltas()->withdrawPending($uid, $target, $isFolder);
+
+                $answer = [
+                    'path' => $target,
                     'owner' => $uid,
                     'deleted' => true,
-                    'manifest' => $bookkeeping,
-                    'bridge' => $this->syncAuthorSources([(string)$resolved['target']]),
+                    // the mode that was actually carried out, and whether it was the one asked for: a
+                    // client can report "the file was deleted, the page stays / was handed over / is
+                    // gone"
+                    'mode' => $mode,
+                    'mode_applied' => false,
+                ];
+
+                if ($mode === '' || !$published) {
+                    if ($isFolder) {
+                        // one write for the whole subtree: what the site still serves asks to be taken
+                        // down, everything else goes with the folder
+                        $bookkeeping = $this->requestTakeDownOfDeleted($target);
+                        $answer['folder'] = true;
+                        $answer['offline_requests'] = $bookkeeping['offline_requests'];
+                        $answer['forgotten'] = $bookkeeping['forgotten'];
+                        $answer['manifest'] = $bookkeeping['manifest'];
+                        $answer['reason'] = $mode === '' ? null : 'folder';
+                        // a candidate that could not be withdrawn keeps its entry and gets no
+                        // request; the caller may retry the delete path for it
+                        $answer['failed'] = $bookkeeping['failed'];
+                        if ($bookkeeping['failed'] !== []) {
+                            $answer['message'] = $this->l10n->t(
+                                'The waiting candidate of %d file(s) could not be withdrawn; those pages were left as they were. Please try again.',
+                                [count($bookkeeping['failed'])],
+                            );
+                        }
+
+                        return new DataResponse([...
+                            $answer,
+                            'transferred' => false,
+                            // the pages of the folder now wait for a decision, even though no mode of
+                            // this request could be applied
+                            'requestOffline' => $bookkeeping['offline_requests'] > 0,
+                            'bridge' => $this->syncAuthorSources([$target]),
+                        ]);
+                    }
+                    // the plain path, and the answer of the two modes for something the site does not
+                    // serve: the entry goes with the file - unless a candidate is still waiting for
+                    // it, because then the entry is the only landing point a later decision has
+                    $answer['manifest'] = $this->forgetArticleEntry($target);
+                    if (($answer['manifest']['pending'] ?? false) === true) {
+                        $answer['mode_applied'] = false;
+                        $answer['failed'] = [$target];
+                        $answer['reason'] = 'candidate-stuck';
+                        $answer['message'] = $this->l10n->t(
+                            'The waiting candidate could not be withdrawn; the entry was kept and no take-off request was recorded. Please try again.',
+                        );
+                        $answer['manifest'] = ['updated' => false];
+
+                        return new DataResponse([...
+                            $answer,
+                            'transferred' => false,
+                            'requestOffline' => false,
+                            'bridge' => $this->syncAuthorSources([$target]),
+                        ]);
+                    }
+                    $answer['reason'] = $mode === '' ? null : 'not-published';
+
+                    return new DataResponse([...
+                        $answer,
+                        'transferred' => false,
+                        'requestOffline' => false,
+                        'bridge' => $this->syncAuthorSources([$target]),
+                    ]);
+                }
+
+                if ($mode === self::DELETE_MODE_OFFLINE) {
+                    // the entry stays, so the page keeps being served from `online/` until a reviewer
+                    // decides - and the request says the source is gone. A refusal now hands the
+                    // published copy over instead of keeping an unmaintainable page online.
+                    //
+                    // It is only recorded while nothing waits in `pending/`: a candidate the delete
+                    // path could not withdraw and a take-off request together would be a state no
+                    // decision can answer. The file is already deleted - that fact is not rolled back -
+                    // but nothing is recorded and the caller is told to retry.
+                    if ($this->review->isPending($target)) {
+                        $answer['mode_applied'] = false;
+                        $answer['failed'] = [$target];
+                        $answer['reason'] = 'candidate-stuck';
+                        $answer['message'] = $this->l10n->t(
+                            'The waiting candidate could not be withdrawn; no take-off request was recorded. Please try again.',
+                        );
+
+                        return new DataResponse([...
+                            $answer,
+                            'transferred' => false,
+                            'requestOffline' => false,
+                            'manifest' => ['updated' => false],
+                            'bridge' => $this->syncAuthorSources([$target]),
+                        ]);
+                    }
+                    $this->review->setFields([$target], [
+                        'downRequest' => ['at' => time(), 'sourceDeleted' => true],
+                        // a new request is not the previous decision: the old note and its author go
+                        'note' => '',
+                        'decidedBy' => '',
+                    ]);
+
+                    return new DataResponse([...
+                        $answer,
+                        'mode_applied' => true,
+                        'transferred' => false,
+                        'requestOffline' => true,
+                        'reason' => $reason,
+                        'manifest' => ['updated' => true],
+                        'bridge' => $this->syncAuthorSources([$target]),
+                    ]);
+                }
+
+                // keep: the published copy becomes the site's own file under the orphan owner, the
+                // manifest entry is forgotten by the handover, and the old address leaves the site
+                // in the same step
+                $transfer = $this->orphanTransfer->transfer($target);
+
+                return new DataResponse([...
+                    $answer,
+                    'mode_applied' => true,
+                    'transferred' => true,
+                    'requestOffline' => false,
+                    'reason' => null,
+                    'transfer' => $transfer,
+                    'manifest' => ['updated' => true],
+                    'bridge' => $this->syncAuthorSources([$target]),
                 ]);
             });
         }
-        [$denied, $site, $userId] = $this->siteContext('edit');
-        if ($denied !== null) {
-            return $denied;
-        }
-        try {
-            $this->files->delete($userId, (string)$site['nc_path'], $path);
-        } catch (\Throwable $e) {
-            return $this->translate($e) ?? throw $e;
-        }
-        return new DataResponse(['path' => $path, 'deleted' => true, 'bridge' => $this->notifyBridge()]);
+
+        return $this->notAnAuthorPath($path);
     }
 
     /**
@@ -554,6 +660,9 @@ class BrowseController extends BaseController
     #[NoAdminRequired]
     public function makeFolder(string $path = ''): DataResponse
     {
+        if (($author = $this->requireAuthor()) !== null) {
+            return $author;
+        }
         if ($this->isAuthorScoped($path)) {
             return $this->authorCall(function () use ($path): DataResponse {
                 $areas = $this->authorAreas();
@@ -574,16 +683,8 @@ class BrowseController extends BaseController
                 ]);
             });
         }
-        [$denied, $site, $userId] = $this->siteContext('edit');
-        if ($denied !== null) {
-            return $denied;
-        }
-        try {
-            $result = $this->files->mkdir($userId, (string)$site['nc_path'], $path);
-        } catch (\Throwable $e) {
-            return $this->translate($e) ?? throw $e;
-        }
-        return new DataResponse([...$result, 'bridge' => $this->notifyBridge()]);
+
+        return $this->notAnAuthorPath($path);
     }
 
     /**
@@ -592,21 +693,25 @@ class BrowseController extends BaseController
      *
      * For an author both ends are targets of their own area, which is what keeps a rename inside the
      * namespace the payload can address. Renaming a file the site serves is not a silent address
-     * change: the new name starts as a draft (see `registerArticle()`), the old address stays in the
-     * published list until a publish carries the move out, and the mirror only gets the new target
-     * once it is approved - so the new address ships with a review, exactly like a new file does.
+     * change: the old address records a take-off request (`downRequest` with `sourceDeleted: true`,
+     * {@see AuthorDeltaService::renamed()}), the new name starts as a draft (its path is new, see
+     * `registerArticle()`), and the commit tree only gets the new target once it is approved - so the
+     * new address ships with a review, exactly like a new file does.
      *
-     * The target's file name may carry a day for the site's own `_posts/**`, where Jekyll reads a
-     * post's date from the name: the same "no later than today" rule the structured save applies to
-     * the `date` field is applied here to the name (see `nameDayNotAfterToday()`). The check runs
-     * before the rename, so a refused move leaves both ends exactly where they were.
+     * The target's file name may carry the article's day: the same "no later than today" rule the
+     * structured save applies to the `date` field is applied here to the name (see
+     * `nameDayNotAfterToday()`). The check runs before the rename, so a refused move leaves both ends
+     * exactly where they were.
      */
     #[NoAdminRequired]
     public function move(string $from = '', string $to = ''): DataResponse
     {
-        // a move is an author-area move when either end names one: the mapper then refuses a target
-        // of the site skeleton, instead of the site branch writing an author target into the source
-        if ($this->isAuthorScoped($from) || $this->isAuthorScoped($to)) {
+        if (($author = $this->requireAuthor()) !== null) {
+            return $author;
+        }
+        // Both ends belong to the caller's own author area: the mapper refuses anything else, and a
+        // rename can therefore never move a file into (or out of) the site's source folder.
+        if ($this->isAuthorScoped($from) && $this->isAuthorScoped($to)) {
             return $this->authorCall(function () use ($from, $to): DataResponse {
                 $areas = $this->authorAreas();
                 $uid = $this->currentUserId();
@@ -633,23 +738,14 @@ class BrowseController extends BaseController
                 ]);
             });
         }
-        [$denied, $site, $userId] = $this->siteContext('edit');
-        if ($denied !== null) {
-            return $denied;
-        }
-        try {
-            $this->nameDayNotAfterToday($to);
-            $result = $this->files->rename($userId, (string)$site['nc_path'], $from, $to);
-        } catch (\Throwable $e) {
-            return $this->translate($e) ?? throw $e;
-        }
-        return new DataResponse([...$result, 'bridge' => $this->notifyBridge()]);
+
+        return $this->notAnAuthorPath($from !== '' ? $from : $to);
     }
 
     /**
      * Keep the article index current on an author's own save. A brand new author has to be known to
-     * the database before the next configuration push asks who the authors are, otherwise their first
-     * article would only reach the site after somebody happened to list the articles.
+     * the database, otherwise their first article is missing from every list until a scan happens to
+     * run.
      *
      * @param array{ok:bool,code:string,uid:string,file:string,target:string} $resolved
      */
@@ -662,8 +758,8 @@ class BrowseController extends BaseController
             return;
         }
         try {
-            // registering also takes the review decision back: an edited article is a draft again, and
-            // that reset is written to the review manifest (the app's truth) and synced into the cache
+            // registering only refreshes the title/tags row: the visibility state is not touched, so
+            // an approved article stays approved while its text is corrected
             $this->articleIndex->register($uid, $area, (string)$resolved['file'], $target);
         } catch (\Throwable) {
             // The file is already written at this point, so failing the save would tell the author that
@@ -674,27 +770,59 @@ class BrowseController extends BaseController
     }
 
     /**
-     * Whether an endpoint's path is served by the author branch rather than by the site tree.
+     * The author-content delta service, resolved from the container like {@see BaseController::authorAreas()}.
      *
-     * The path's namespace decides, not the caller's identity: a target that names an author area
-     * (`<author_root>/<uid>/…`) is that area's file for everybody, and a caller without the publish
-     * grant addresses nothing else. That is what keeps the author view of the site's storage user -
-     * their own `Pages/` folder, mirrored into `<author_root>/<uid>/` - out of the site source tree
-     * they happen to own, and it is the same rule the two article endpoints decide by.
+     * It is asked for one thing only here: recording that an approved article's content changed.
+     */
+    private function authorDeltas(): AuthorDeltaService
+    {
+        return Server::get(AuthorDeltaService::class);
+    }
+
+    /**
+     * Whether an endpoint's path names an author area - the only namespace this controller serves.
      *
-     * The retired `_posts/<uid>/…` prefix is deliberately **not** part of it: `_posts/` is a folder of
-     * the site itself, and an editor may keep posts in a subfolder of it. A caller without the
-     * publish grant still has such a legacy target resolved (the mapper accepts it for every
-     * endpoint); an editor, who reaches the whole site, means the site when naming that folder.
+     * The path decides, not the caller's identity: a target that names an author area
+     * (`<author_root>/<uid>/…`) is that area's file for everybody, and nothing else is served here at
+     * all. The mapper decides whether the caller may reach *that* area (its own, or any for the
+     * review-and-publish grant), which is the ownership rule every endpoint shares.
      */
     private function isAuthorScoped(string $path): bool
     {
         if (!$this->canEdit()) {
+            // An author addresses their own area directly (`notes/a.md`), and the mapper resolves that
+            // path inside it. There is no other namespace this app serves any more, so for a caller
+            // without the site-wide grant every path is an author path.
             return true;
         }
-        $areas = $this->authorAreas();
 
-        return $areas->uidOfTarget($path) !== null && !$areas->isLegacyTarget($path);
+        return $this->authorAreas()->uidOfTarget($path) !== null;
+    }
+
+    /**
+     * The refusal for a path that is not inside an author area. The site's own source folder is not
+     * editable through this app (its writers are the Files app / WebDAV, Import and Pull), so saying
+     * why is better than a bare 403.
+     */
+    private function notAnAuthorPath(string $path): DataResponse
+    {
+        return new DataResponse(
+            [
+                'error' => 'NOT_AN_AUTHOR_PATH',
+                'message' => $this->l10n->t('This app edits your own author area only; the site source is edited in the Files app, or replaced by Import and Pull.'),
+                'path' => $path,
+            ],
+            403,
+        );
+    }
+
+    /** The refusal for an article endpoint called with a path that is not an article of an author area. */
+    private function notAnArticlePath(string $path): DataResponse
+    {
+        return new DataResponse(
+            ['error' => 'BAD_REQUEST', 'message' => $this->l10n->t('Not an article path: %s', [$path])],
+            400,
+        );
     }
 
     /**
@@ -1119,27 +1247,28 @@ class BrowseController extends BaseController
     }
 
     /**
-     * A date in a *site* post's file name.
+     * A date in an author target's file name.
      *
-     * A Jekyll post's date is part of its name (`_posts/**`, `YYYY-MM-DD-slug.md`) and the site reads
-     * it from there, so a name is the second way a date enters such a file: creating a file and
-     * renaming one (a move is the rename) both change it. A name that schedules a post the site does
-     * not show is the same accident the `date` field is refused for, so it is refused here as well,
-     * with the instance's own day as the boundary (`isAfterToday()`, PHP runs in UTC). Today and every
-     * earlier day are accepted, which is what keeps a rename that only changes the slug working.
+     * The date of an article is its front-matter `date` and, while no key is set, the `YYYY-MM-DD-`
+     * prefix of its file name ({@see FrontMatter::date()}), so a name is the second way a date enters
+     * an article: creating a file and renaming one (a move is the rename) both change it. A name that
+     * puts the article in the future is the same accident the `date` field is refused for, so it is
+     * refused here as well, with the instance's own day as the boundary (`isAfterToday()`, PHP runs in
+     * UTC). Today and every earlier day are accepted, which is what keeps a rename that only changes
+     * the slug working.
      *
-     * Only the site skeleton is held to this rule. An author's file is a template page, and Jekyll
-     * takes a page's date from its front matter - never from its name - so a page may be called
-     * `2026-01-01-notes.md` without any of this meaning anything.
+     * Only an author target is held to this rule: the site skeleton's own `_posts/**` is not edited
+     * through this app.
      *
      * @throws \InvalidArgumentException when the name carries a day later than today
      */
     private function nameDayNotAfterToday(string $path): void
     {
         $clean = ltrim(str_replace('\\', '/', trim($path)), '/');
-        // only the site's own `_posts/**` carries a date in its name: an author's file is a template
-        // page, and its address comes from its title, never from a day in its file name
-        if (!str_starts_with($clean, AuthorAreaService::LEGACY_PREFIX . '/')) {
+        // the only targets this controller edits are <author_root>/<uid>/…: everything else is the
+        // site's own tree, which is written by the Files app, Import and Pull
+        $prefix = rtrim($this->authorAreas()->authorRoot(), '/') . '/';
+        if ($prefix === '/' || !str_starts_with($clean, $prefix)) {
             return;
         }
         if (preg_match('/^(\d{4}-\d{2}-\d{2})/', basename($clean), $day) !== 1) {
@@ -1200,26 +1329,6 @@ class BrowseController extends BaseController
         return $value;
     }
 
-    /**
-     * A site-relative path as an article target, or null when it names something else: an author's
-     * renderable file (`<author_root>/<uid>/…`) or a post of the site's own `_posts/`. That is exactly
-     * the rule the index scans with, so an image, a layout or `_config.yml` can never be pulled into
-     * the fields panel.
-     */
-    private function articleTarget(string $path): ?string
-    {
-        $clean = ltrim(str_replace('\\', '/', trim($path)), '/');
-        $areas = $this->authorAreas();
-        if ($areas->uidOfTarget($clean) !== null) {
-            return $areas->isRenderable($clean) ? '/' . $clean : null;
-        }
-        if (!str_starts_with($clean, '_posts/') || !$areas->isRenderable($clean)) {
-            return null;
-        }
-
-        return '/' . $clean;
-    }
-
     /** A front-matter value as a field value: its text when it is a scalar, '' when it cannot be one. */
     private static function fieldText(mixed $value): string
     {
@@ -1252,20 +1361,37 @@ class BrowseController extends BaseController
         $node['state'] = '';
         $node['intent'] = '';
         $node['live'] = false;
+        $node['pushFailed'] = false;
+        $node['published'] = false;
+        $node['candidate'] = false;
+        $node['candidateAt'] = 0;
+        $node['downRequest'] = false;
         if (!$isDir && $node['target'] !== '') {
-            // the author of the entry: the front end needs it to tell a reviewer's own request from
-            // somebody else's (nobody decides about their own request)
+            // the author of the entry: the front end needs it to tell the caller's own entry from
+            // somebody else's (the decision rules do not look at the owner: a reviewer may decide
+            // about any entry, their own included, and `decidedBy` records who answered)
             $node['owner'] = $uid;
-            $node['state'] = ReviewStore::stateOf($manifest, (string)$node['target']);
+            $target = (string)$node['target'];
+            $node['state'] = $this->review->stateIn($manifest, $target);
             // the direction of a pending request, for the row that offers "withdraw"
-            $node['intent'] = ReviewStore::intentOf($manifest, (string)$node['target']);
-            // `live` is the site's own answer (the published list), never the visibility state: an
-            // entry approved for the site that no commit has carried yet is not served
-            $node['live'] = ReviewStore::isPublished($manifest, (string)$node['target']);
+            $node['intent'] = $this->review->intentIn($manifest, $target);
+            // `live` is the site's own answer (`online/<target>`), never the visibility state: an
+            // article that a reviewer approved but that no publish has carried is not served yet
+            $node['live'] = $this->review->isLive($target);
+            $node['pushFailed'] = $node['live'] && $this->registry->getPublishPushFailure() !== null;
+            // the folder-derived facts: whether the site serves a version, whether one waits in
+            // pending/ (and since when), and whether a take-offline request is waiting
+            $pending = $this->review->isPending($target);
+            $pendingAt = $this->review->pendingStamp($target);
+            $downRequest = ReviewStore::downRequestOf($manifest, $target);
+            $node['published'] = $node['live'];
+            $node['candidate'] = $pending;
+            $node['candidateAt'] = $pendingAt;
+            $node['downRequest'] = $downRequest !== null;
             // the request's other facts travel with the row: "requested on <date>" needs the moment,
             // and a rejected request shows whose decision and why
-            $entry = ReviewStore::entryOf($manifest, (string)$node['target']);
-            $node['submittedAt'] = (int)($entry['submittedAt'] ?? 0);
+            $entry = ReviewStore::entryOf($manifest, $target);
+            $node['submittedAt'] = $pendingAt > 0 ? $pendingAt : ($downRequest['at'] ?? 0);
             $node['decidedBy'] = (string)($entry['decidedBy'] ?? '');
             $node['reviewNote'] = (string)($entry['note'] ?? '');
         }
@@ -1364,21 +1490,34 @@ class BrowseController extends BaseController
 
     /**
      * Forgets the bookkeeping of one deleted file: its manifest entry (and the cache row), so nothing
-     * is left to request. The `published` list is deliberately kept - a path the site still serves is
-     * what the next publish stages the removal from.
+     * is left to request. `online/<target>` is deliberately kept - the site still serves the page
+     * until a reviewer takes it down, and the absence from the source folder is not a decision.
+     *
+     * A candidate still waiting in `pending/` is the exception: forgetting the entry would leave the
+     * frozen copy with nothing a later decision can be written to (and with no entry a reviewer could
+     * find), so the entry is kept and the answer says `pending => true` - the caller reports the
+     * target in `failed` instead of claiming it was forgotten. The file is already deleted at this
+     * point; that fact is not rolled back.
      *
      * A failure is reported in the answer instead of thrown: the file is already gone at this point,
      * and a stale manifest entry is repaired by the next scan, while an exception would tell the
      * author that the deletion did not happen.
      *
      * @param string $target the file as a site target
-     * @return array{updated:bool,message?:string}
+     * @return array{updated:bool,pending?:bool,message?:string}
      */
     private function forgetArticleEntry(string $target): array
     {
         $key = ltrim(trim(str_replace('\\', '/', $target)), '/');
         if ($key === '') {
             return ['updated' => true];
+        }
+        if ($this->review->isPending($key)) {
+            return [
+                'updated' => false,
+                'pending' => true,
+                'message' => $this->l10n->t('The waiting candidate could not be withdrawn; the entry was kept.'),
+            ];
         }
         try {
             $this->review->forgetArticle([$key]);
@@ -1390,38 +1529,53 @@ class BrowseController extends BaseController
     }
 
     /**
-     * Forgets the review bookkeeping of everything a folder held: the files are gone with it, so
-     * nothing about them is left to decide.
+     * The bookkeeping of a deleted folder: every target the site still serves asks to be taken down,
+     * every other target goes with the folder, and a target whose candidate could not be withdrawn is
+     * left as it was and reported in `failed`.
      *
-     * A failure is reported in the answer instead of thrown - the folder is already deleted at this
-     * point, and a stale manifest entry is repaired by the next scan, while an exception would tell
-     * the author that the deletion did not happen.
+     * The rule itself is the manifest's ({@see ReviewStore::requestTakeDownForDeletedSources()}), and
+     * it is the same one the file event applies to a single deleted file
+     * ({@see AuthorDeltaService::deleted()}): a page the site serves must keep its entry, because that
+     * entry is the only place a reviewer can take the page down from - and a take-down is the only
+     * operation that clears `online/<target>`. The file event's `remove` delta drops the preview copy
+     * only, so a folder whose published files were merely forgotten would keep their pages online for
+     * good.
+     *
+     * A failure is reported in the answer instead of thrown, like {@see self::forgetArticleEntry()}
+     * does: the folder is already deleted at this point, and a manifest that could not be written is
+     * repaired by the next scan, while an exception would tell the author that the deletion did not
+     * happen.
      *
      * @param string $target the folder as a site target
-     * @return array{updated:bool,message?:string}
+     * @return array{manifest:array{updated:bool,message?:string},offline_requests:int,forgotten:int,failed:list<string>}
      */
-    private function forgetAuthorEntries(string $target): array
+    private function requestTakeDownOfDeleted(string $target): array
     {
         $key = ltrim(trim(str_replace('\\', '/', $target)), '/');
         if ($key === '') {
-            return ['updated' => true];
+            return [
+                'manifest' => ['updated' => true],
+                'offline_requests' => 0,
+                'forgotten' => 0,
+                'failed' => [],
+            ];
         }
         try {
-            $manifest = $this->review->read();
-            $keys = [];
-            foreach (array_keys($manifest['entries'] + $manifest['published']) as $path) {
-                if (str_starts_with((string)$path, $key . '/')) {
-                    $keys[] = (string)$path;
-                }
-            }
-            if ($keys !== []) {
-                $this->review->forgetArticle($keys);
-                $this->review->forget($keys);
-            }
+            $plan = $this->review->requestTakeDownForDeletedSources([$key], time());
 
-            return ['updated' => true];
+            return [
+                'manifest' => ['updated' => true],
+                'offline_requests' => count($plan['requested']),
+                'forgotten' => count($plan['forgotten']),
+                'failed' => $plan['failed'],
+            ];
         } catch (\Throwable $e) {
-            return ['updated' => false, 'message' => $e->getMessage()];
+            return [
+                'manifest' => ['updated' => false, 'message' => $e->getMessage()],
+                'offline_requests' => 0,
+                'forgotten' => 0,
+                'failed' => [],
+            ];
         }
     }
 
@@ -1477,6 +1631,10 @@ class BrowseController extends BaseController
      * Runs the body of an author-scoped endpoint, mapping the exceptions it may raise to the same
      * structured errors the rest of the app answers with.
      *
+     * This is the exception mapper, **not** the gate: every caller has already passed the authoring
+     * capability check at its method entry ({@see BaseController::requireAuthor()}), so wrapping the
+     * body alone would never be an authorization.
+     *
      * @param callable():DataResponse $body
      */
     private function authorCall(callable $body): DataResponse
@@ -1487,25 +1645,6 @@ class BrowseController extends BaseController
             return new DataResponse($e->toArray(), 409);
         } catch (\Throwable $e) {
             return $this->translate($e) ?? throw $e;
-        }
-    }
-
-    /**
-     * Notifies the bridge of a change; a failed notification is not a failed save, the file is
-     * already on disk, so the error is handed back to the UI instead.
-     *
-     * @return array<string,mixed>
-     */
-    private function notifyBridge(): array
-    {
-        try {
-            return ['notified' => true, 'result' => $this->bridge->notify()];
-        } catch (\Throwable $e) {
-            return [
-                'notified' => false,
-                'error' => $e instanceof BridgeException ? $e->getBridgeCode() : 'ERROR',
-                'message' => $e->getMessage(),
-            ];
         }
     }
 }

@@ -51,14 +51,18 @@ def _bridge_url(cfg: Config) -> str:
 
 def _print_pair_code(cfg: Config) -> None:
     """Issue a one-time code and print everything the administrator has to type or paste."""
-    code = pairing.issue(cfg.state_dir)
+    # The bootstrap state_dir (the TOML's), never the pushed one: POST /pair reads the code there, so
+    # the file this command writes and the file the running bridge checks are the same one.
+    code = pairing.issue(cfg.bootstrap_state_dir)
     print(f"pairing code : {code}")
     print(f"bridge URL   : {_bridge_url(cfg)}")
+    print(f"code file    : {pairing.pairing_path(cfg.bootstrap_state_dir)}")
     print(f"valid        : {pairing.TTL_S} s, one-time use, {pairing.MAX_ATTEMPTS} wrong attempts kill it")
     print(f"note         : {SAME_MACHINE_NOTE}")
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the selected subcommand; the return value is the process exit code."""
     args = _build_parser().parse_args(argv)
 
     if args.command == "gen-secret":
@@ -86,9 +90,13 @@ def main(argv: list[str] | None = None) -> int:
         if cfg.site is None:
             print("  site: none configured yet - the app pushes it while pairing")
         else:
-            print(f"  source={cfg.site.source}")
-            print(f"  work={cfg.site.work} (commit tree)")
-            print(f"  preview={cfg.site.preview} (built, served)")
+            print(f"  source={cfg.site.source} (the site folder in Nextcloud)")
+            print(f"  source_dir={cfg.site.source_dir} (the required skeleton)")
+            print(f"  online_dir={cfg.site.online_dir} (published, bridge-written)")
+            print(f"  pending_dir={cfg.site.pending_dir} (frozen candidates, bridge-written)")
+            print(f"  work={cfg.site.work} (the flat git working tree: source/ + online/, a Pull exports it)")
+            print(f"  preview={cfg.site.preview} (source + online + authors, built and served)")
+            print(f"  onlinepreview={cfg.site.onlinepreview} (source + online + pending, built and served)")
             print(f"  recipe={cfg.site.recipe.preset} output={cfg.site.output_dir}")
         return 0
 

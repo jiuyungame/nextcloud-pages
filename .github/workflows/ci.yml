@@ -1,6 +1,6 @@
 # Continuous integration: everything that can run without a Nextcloud instance.
 #
-# The acceptance suites under tests/*.sh need a live instance with its own credentials, so they stay a
+# The acceptance suites under tests/live/*.sh need a live instance with its own credentials, so they stay a
 # local step (README, "Development"). Anything that only needs the sources runs here.
 name: ci
 
@@ -40,7 +40,7 @@ jobs:
       - name: The committed bundles are the build of src
         run: git diff --exit-code -- js css
       - name: Template placement and render proof
-        run: node tests/proof-frontend.mjs
+        run: node tests/code/proof-frontend.mjs
 
   bridge:
     name: Bridge smoke
@@ -83,15 +83,9 @@ jobs:
           const CATALOGUE = 'l10n/zh_CN.json'
 
           // A ratchet, not an allow-list: a key listed here that becomes translated also fails, so the
-          // list can only shrink. These five are long server hints plus one app name; add them to the
-          // catalogue and delete them here.
-          const KNOWN_GAPS = new Set([
-            'The build command, the output folder and the site-level exclusions duplicate the bridge\'s own configuration ([site.recipe] and exclude/unexclude in its TOML, `occ pages:config` for the global list), so they are not edited here: the stored values are kept and "Save site" does not reset them.',
-            'The site has no readable %1$s, so the author mirror falls back to its default directory %2$s. If the site is not the Jekyll authors template at all, ignore this; otherwise the app\'s author content directory (%3$s) has to be the same name.',
-            'The site reads its author folders from %1$s, the app writes them to %2$s: the mirror is invisible to the site, so no author page is ever built. Set authors.source to %2$s in the site\'s %3$s (or change the author content directory to %1$s), then rebuild.',
-            'The visibility manifest %s is not there yet; it is written by the first visibility action (a request, a decision or a publish). It lives in the app\'s own private storage, not in anybody\'s files and not editable through the Files app, and until it exists every article counts as internal and nothing is on the site.',
-            'pages-admin',
-          ])
+          // list can only shrink. It is empty today - every literal key the app passes to a translator
+          // is in the catalogue - and a gap belongs here only while it is deliberately left in English.
+          const KNOWN_GAPS = new Set([])
 
           function files(dir, out = []) {
             for (const name of readdirSync(dir)) {
@@ -143,6 +137,8 @@ jobs:
             process.exit(1)
           }
 
-          console.log(`ok: every key is either translated or one of the ${KNOWN_GAPS.size} known gaps`)
+          console.log(KNOWN_GAPS.size === 0
+            ? 'ok: every key is translated'
+            : `ok: every key is either translated or one of the ${KNOWN_GAPS.size} known gaps`)
           JS
           node "$script"

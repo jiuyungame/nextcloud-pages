@@ -4,85 +4,138 @@ declare(strict_types=1);
 
 namespace OCA\Pages\Service;
 
+use OCA\Pages\AppInfo\Application;
 use OCA\Pages\Db\Article;
 use OCA\Pages\Db\ArticleMapper;
-use OCA\Pages\Db\PublishedMapper;
+use OCA\Pages\Notification\Notifier;
 use OCP\Files\NotPermittedException;
 use OCP\IL10N;
+use OCP\IURLGenerator;
 use OCP\IUserManager;
+use OCP\Lock\ILockingProvider;
+use OCP\Lock\LockedException;
+use OCP\Notification\IManager;
 
 /**
- * The visibility workflow: a page is `internal` until a reviewer approves it for the site.
+ * The visibility workflow, in the directory-derived model.
  *
- * A page has exactly three states, and the review decides only **whether it goes live** - never what
- * the page says:
+ * Three facts decide everything, and none of them is stored twice:
  *
- *   internal ──request(online)──▶ requested(online) ──approve──▶ external ──publish──▶ on the site
- *      ▲                              │                              │
- *      │                              └──reject (note)──▶ internal   │
- *      └──────────────────── cancel ────────────────────┘           │
- *                                                                   │
- *   external ──request(offline)──▶ requested(offline) ──approve──▶ internal ──publish──▶ off the site
- *                    │
- *                    └──cancel──▶ external          external ──reject (下线)──▶ internal
+ *   `pending/<target>`   an online request: the bytes the bridge froze when the author asked
+ *                        (`candidate` op). A reviewer's approval (`publish`) moves them to `online/`.
+ *   `downRequest`        an offline request: the author's intention to take the site's version off.
+ *                        It is the one request the folders cannot express, so the manifest carries it.
+ *   `online/<target>`    the version the site serves.
  *
- * Every transition is enforced in this class, one method per author action: {@see self::request()}
- * (internal→requested(online), external→requested(offline)), {@see self::cancel()} (requested→back to
- * what it was), {@see self::decide()} (requested→external or internal by the intent, requested and
- * external→internal on a rejection), and {@see self::markPublished()} (external stays external, the
- * commit is recorded). Nothing else writes a state.
+ * and the three-state value the rest of the app reads is derived: something pending → `requested`,
+ * otherwise something online → `external`, otherwise `internal`.
  *
- * The state lives in the visibility manifest - a file in the app's own appdata, see {@see ReviewStore} -
- * never in the article: an article stays a plain Jekyll page with no extra front matter, so the same
- * markdown builds the same way whether it is internal or live. That is also what makes "the site has
- * it" and "it is approved for the site" two separate facts: `external` is the approval, and the
- * manifest's `published` list is what the last commit really carried. An entry can therefore be
- * external and not yet served, which is exactly the window between a decision and the next publish.
+ *   internal ──request(online)──▶ pending/<target> ──approve (publish)──▶ online/<target>
+ *       ▲                              │
+ *       │                              └──reject / cancel (discard)──▶ back to what it was
+ *       │
+ *   online ──request(online)──▶ pending + online   (an online page asks for its new content)
+ *        │                          ├── approve ──▶ online = the frozen bytes
+ *        │                          └── reject  ──▶ pending gone, online kept (old page stays)
+ *        │
+ *        ├──request(offline)──▶ downRequest + online
+ *        │                          ├── approve (take-down) ──▶ nothing (internal)
+ *        │                          └── reject ──▶ downRequest gone, online kept (page stays up)
+ *        │
+ *        └──take-down (a reviewer, nothing pending) ──▶ nothing (internal)
  *
- * Getting an article off the site is the same pair of states in the other direction, and a pending
- * request never changes what the site serves: `external` + `requested(offline)` is still on the site
- * until the approval ({@see ReviewStore::onSite()}), so an author's request cannot take a public page
- * down by itself.
+ * The bridge is the other half of every decision and is called **before** anything is recorded: a
+ * request freezes the candidate, an approval publishes it, a rejection or a withdrawal discards it, a
+ * take-down removes it from the site. A bridge failure therefore leaves the folders, the manifest and
+ * the site exactly as they were - the author or reviewer is told the operation failed and may try
+ * again. The one exception is the offline request, which has no content and therefore no bridge call:
+ * it is an intention until a reviewer acts on it.
  *
- * Deleting is not a workflow of this class: a deleted file is a direct delete (Nextcloud's trash keeps
- * a copy), and the next publish carries the removal out of the commit because the manifest's
- * `published` list still names the path ({@see self::classify()}).
+ * **A request writes one thing, an approval writes none.** The candidate is the file in `pending/`,
+ * the publication is the file in `online/`; recording either a second time is what the old snapshot
+ * model did, and the copy is what went stale. The one exception is the candidate's **digest**: the
+ * bridge answers the sha256 of the bytes it froze, and the entry carries it (`candidateDigest`, next
+ * to the owner) so that the approval can prove it is publishing exactly the bytes the reviewer saw.
+ * An offline request, a refusal and a take-down still leave their own record - a down request, the
+ * reviewer's note, the reviewer's name.
  *
- * Every change goes through the store, which writes the manifest and then syncs the database caches
- * (`pages_articles`, `pages_published`). Those tables are read here for the counts - a cache serves
- * queries and sorting - while anything that *decides* something (which articles may be committed,
- * what state an article is in) asks the manifest.
+ * Deleting a file is not a workflow of this class: it is a direct delete (Nextcloud's trash keeps a
+ * copy), the pending request about it is withdrawn by the delete path, and the removal of the page
+ * from the site is a `downRequest` ({@see ReviewStore::requestTakeDownForDeletedSources()}).
+ *
+ * Every change goes through the store, which writes the manifest (when there is anything to write)
+ * and then syncs `pages_articles`. That table is a cache: the counts and the queue are read from it,
+ * while anything that *decides* something asks the folders.
+ *
+ * A decision is one critical section per article: `request`, `decide`, `takeDown` and `cancel` take
+ * an exclusive lock on the target for the whole read - bridge call - manifest write
+ * ({@see self::withReviewLock()}), so two reviewers cannot interleave their answers about one page,
+ * and a request cannot slip between a reviewer's read and their bridge call. Different articles
+ * never wait for each other.
  */
 class ArticleReviewService
 {
     /** A request older than this is mentioned by the doctor, not failed. */
     public const STALE_REQUEST_DAYS = 14;
 
+    /**
+     * The lock one decision about one article holds for its whole read - bridge call - manifest
+     * write: two reviewers acting on the same target exclude each other, while different targets
+     * never wait for one another.
+     */
+    private const REVIEW_LOCK_PREFIX = 'pages-review-';
+
     public function __construct(
         private ArticleMapper $articles,
-        private PublishedMapper $published,
         private ReviewStore $store,
         private FileService $files,
         private AuthorAreaService $areas,
         private SiteRegistry $registry,
         private ArticleIndexService $index,
+        private BridgeClient $bridge,
         private IL10N $l10n,
         private IUserManager $userManager,
+        private IManager $notifications,
+        private IURLGenerator $url,
+        private OrphanTransfer $orphanTransfer,
+        private ILockingProvider $locking,
     ) {
     }
 
     /**
      * The author's request: put this page on the site (`online`), or take it off (`offline`).
      *
-     * Asking twice for the same thing is not an error, so a double click is harmless and does not
-     * move the moment the request was made. A caller with the review or publish grant may file it for
-     * anybody's page (a reviewer's own route to the same decision), an author only for their own.
+     * Both directions start from "nothing is pending": while a request waits, a second one - either
+     * direction - is a conflict, because the two together would say the author wants the page on and
+     * off the site at the same time. Withdrawing the waiting request is the way to change one's mind.
+     *
+     * An **online** request asks the bridge to freeze the file's current bytes into `pending/`. Those
+     * bytes are the candidate, and an edit after the request is not part of it - a reviewer decides
+     * about exactly the content the author asked for. The bridge also answers the sha256 of the frozen
+     * bytes, and the entry records it as `candidateDigest`: the approval sends it back, so a candidate
+     * the author replaces while the request waits cannot be published by a retried approval. A bridge
+     * that refuses (a source that is not there, a broken bridge) throws and nothing is recorded: what
+     * the folders hold is what happened.
+     *
+     * An **offline** request needs a version the site actually serves (`online/`), and has no content
+     * of its own, so it is recorded without a bridge call: the entry carries `downRequest` with the
+     * moment and `sourceDeleted: false` (the author keeps the file).
+     *
+     * A caller with the review grant may file it for anybody's page, an author only for their own.
+     *
+     * The whole body - the conflict check, the bridge call that freezes the candidate, and the
+     * manifest write that binds its digest - is one critical section per article
+     * ({@see self::withReviewLock()}), so a decision cannot read "nothing pending" while the request
+     * is between its bridge call and its write. The offline direction has no bridge call of its own
+     * and therefore refuses while the content directories cannot be confirmed
+     * ({@see ReviewStore::requireTrustedTrees()}).
      *
      * @param string $intent `online` or `offline`
      * @throws \InvalidArgumentException when the intent is not one of the two, or the target is no article
      * @throws NotPermittedException when it is somebody else's article
-     * @throws ConflictException when the entry is in a state the intent cannot start from
-     * @return array{path:string,state:string,intent:string,created:bool,owner:string}
+     * @throws ConflictException when a request is already waiting, or the direction cannot start here
+     * @throws BridgeException when the bridge cannot freeze the candidate
+     * @return array{path:string,state:string,intent:string,created:bool,owner:string,candidateDigest?:string,cache_synced:bool,cache_message:string}
      */
     public function request(string $viewerUid, string $target, string $intent, bool $mayDecide): array
     {
@@ -93,8 +146,6 @@ class ArticleReviewService
         $path = (string)$article->getPath();
         $owner = trim((string)$article->getOwnerUid());
         if ($owner === '') {
-            // a skeleton post is published with the site by an editor; there is no owner whose folder
-            // a visibility decision could move it out of
             throw new ConflictException($this->l10n->t(
                 'This article belongs to the site itself; an editor publishes it with the site.',
             ));
@@ -103,93 +154,185 @@ class ArticleReviewService
             throw new NotPermittedException($this->l10n->t('You may only request a change for your own articles.'));
         }
 
-        $manifest = $this->store->read();
-        $state = ReviewStore::stateOf($manifest, $path);
-        $pending = ReviewStore::intentOf($manifest, $path);
-        if ($state === Article::STATE_REQUESTED) {
-            if ($pending === $intent) {
-                // the same request twice is the same fact: a double click must not move its moment
-                return ['path' => $path, 'state' => $state, 'intent' => $intent, 'created' => false, 'owner' => $owner];
+        return $this->withReviewLock($path, function () use ($path, $owner, $intent): array {
+            $manifest = $this->store->read();
+            $pending = $this->store->isPending($path);
+            $downRequest = ReviewStore::downRequestOf($manifest, $path);
+            if ($pending || $downRequest !== null) {
+                // both directions start from "nothing is pending": the waiting request may be the other
+                // one, and either way a second intent on the same page would make the reviewer answer two
+                // questions at once
+                throw new ConflictException($this->l10n->t(
+                    $pending
+                        ? 'A request to publish this article is already waiting for a decision; withdraw it first.'
+                        : 'A request to take this article off the site is already waiting for a decision; withdraw it first.',
+                ), ['pending' => $pending, 'downRequest' => $downRequest !== null]);
             }
-            // the other direction does not apply either: a pending online request is not on the site
-            // yet, so there is nothing to take offline, and vice versa
-            throw new ConflictException($this->l10n->t(
-                $pending === Article::INTENT_ONLINE
-                    ? 'The site does not have this article yet; withdraw the online request first.'
-                    : 'The site still has this article; withdraw the offline request first.',
-            ));
-        }
-        if ($intent === Article::INTENT_ONLINE && $state !== Article::STATE_INTERNAL) {
-            throw new ConflictException($this->l10n->t('This article is approved for the site already.'));
-        }
-        if ($intent === Article::INTENT_OFFLINE && $state !== Article::STATE_EXTERNAL) {
-            throw new ConflictException($this->l10n->t(
-                'The site does not have this article, so there is nothing to take offline.',
-            ));
-        }
 
-        $this->store->setState([$path], Article::STATE_REQUESTED, [
-            'owner' => $owner,
-            'intent' => $intent,
-            'note' => '',
-            'decidedBy' => '',
-            'submittedAt' => time(),
-        ]);
+            if ($intent === Article::INTENT_ONLINE) {
+                // a failure here throws (BridgeException) and nothing below runs: the folders keep saying
+                // "nothing is pending", which is what the bridge holds
+                $answer = $this->bridge->reviewOp('candidate', $owner, $path);
+                $digest = trim((string)($answer['digest'] ?? ''));
+                $this->store->refreshTrees();
+                // the fingerprint of the frozen bytes, next to `downRequest` in the entry's vocabulary.
+                // Written even when the bridge answers none: an empty value clears a digest a previous
+                // request left behind, so an old bridge never makes the next approval compare against
+                // bytes nobody reviewed.
+                $this->store->setFields([$path], ['owner' => $owner, 'candidateDigest' => $digest]);
 
-        return ['path' => $path, 'state' => Article::STATE_REQUESTED, 'intent' => $intent, 'created' => true, 'owner' => $owner];
+                return $this->withCacheState([
+                    'path' => $path,
+                    'state' => Article::STATE_REQUESTED,
+                    'intent' => $intent,
+                    'created' => true,
+                    'owner' => $owner,
+                    'candidateDigest' => $digest,
+                ]);
+            }
+
+            // the offline direction has no bridge call of its own, so the only evidence that the site
+            // serves the article is the content directories. When the bridge cannot confirm them the
+            // fallback may simply lag behind a published file, and "nothing to take offline" would be
+            // a guess: refuse and let the author retry.
+            $this->store->requireTrustedTrees();
+            if (!$this->store->isLive($path)) {
+                throw new ConflictException($this->l10n->t(
+                    'The site does not have this article, so there is nothing to take offline.',
+                ));
+            }
+            $this->store->setFields([$path], [
+                'owner' => $owner,
+                'downRequest' => ['at' => time(), 'sourceDeleted' => false],
+                // a new request is not the previous decision: the rejection note and its author go with it
+                'note' => '',
+                'decidedBy' => '',
+            ]);
+
+            return ['path' => $path, 'state' => Article::STATE_REQUESTED, 'intent' => $intent, 'created' => true, 'owner' => $owner];
+        });
     }
 
     /**
-     * Withdraw a pending request: the entry returns to the state its intent started from - internal for
-     * an online request, external for an offline one. Nothing about the site changes either way, which
-     * is why a withdrawal needs no bridge call.
+     * Withdraw a pending request.
      *
-     * The author of the article or a holder of the review/publish grant may withdraw it; the same rule
-     * as filing it, because a reviewer may have filed it on the author's behalf.
+     * A waiting candidate is discarded on the bridge (`pending/<target>` goes, the review tree returns
+     * to what `online/` serves) and then re-read, so the derived state is the folder's answer again. An
+     * offline request has no content, so clearing the manifest is the whole withdrawal.
+     *
+     * The author of the article or a holder of the review grant may withdraw it; the same rule as
+     * filing it, because a reviewer may have filed it on the author's behalf.
      *
      * @throws \InvalidArgumentException when the target is no article
      * @throws NotPermittedException when the caller is neither the author nor a grant holder
-     * @throws ConflictException when no request is waiting
-     * @return array{path:string,state:string,intent:string,cancelled:bool,owner:string}
+     * @throws ConflictException when no request is waiting, or another decision about the article is in progress
+     * @throws BridgeException when the waiting candidate cannot be discarded
+     * @return array{path:string,state:string,intent:string,cancelled:bool,owner:string,cache_synced:bool,cache_message:string}
      */
     public function cancel(string $viewerUid, string $target, bool $mayDecide): array
     {
-        $article = $this->require($target);
-        $path = (string)$article->getPath();
-        $owner = trim((string)$article->getOwnerUid());
+        // the path has to be known before `require()`: a candidate in `pending/` is not an article
+        // the index knows, and withdrawing it must not answer 404 just because the row (or the
+        // source file) is not there
+        $path = $this->path($target);
+        $owner = '';
+        try {
+            $article = $this->require($target);
+            $path = (string)$article->getPath();
+            $owner = trim((string)$article->getOwnerUid());
+        } catch (\InvalidArgumentException $e) {
+            // X1: the bridge froze the candidate and the process died before the request wrote the
+            // entry (and the article row). The candidate is the only state there is, and the author
+            // is named by the path; withdrawing must still work. `NotFoundException` is a subclass
+            // of `\InvalidArgumentException`, so both shapes arrive here.
+            if ($path === '' || !$this->store->isPending($path)) {
+                throw $e;
+            }
+            $owner = $this->ownerOf([], $path);
+        }
         if ($owner !== $viewerUid && !$mayDecide) {
             throw new NotPermittedException($this->l10n->t('You may only withdraw a request about your own articles.'));
         }
-        $manifest = $this->store->read();
-        $entry = $this->requireEntry($manifest, $path);
-        if (($entry['state'] ?? '') !== Article::STATE_REQUESTED) {
-            throw new ConflictException($this->l10n->t('No request is waiting for a decision on this article.'));
-        }
-        $intent = ReviewStore::intentOf($manifest, $path);
-        $state = $intent === Article::INTENT_OFFLINE ? Article::STATE_EXTERNAL : Article::STATE_INTERNAL;
-        // the intent is the request: withdrawing it leaves the state the request started from, and the
-        // moment it was made stays as the record of the last request
-        $this->store->setState([$path], $state, ['intent' => '', 'note' => '', 'decidedBy' => '']);
 
-        return ['path' => $path, 'state' => $state, 'intent' => $intent, 'cancelled' => true, 'owner' => $owner];
+        return $this->withReviewLock($path, function () use ($path, $owner): array {
+            $manifest = $this->store->read();
+            $entry = ReviewStore::entryOf($manifest, $path);
+            $pending = $this->store->isPending($path);
+            $downRequest = ReviewStore::downRequestOf($manifest, $path);
+            if (!$pending && $downRequest === null) {
+                throw new ConflictException($this->l10n->t('No request is waiting for a decision on this article.'));
+            }
+            if ($pending) {
+                $this->bridge->reviewOp('discard', $owner, $path);
+                $this->store->refreshTrees();
+            }
+            if ($entry !== []) {
+                // the entry's own record of the withdrawn request goes; the owner (and the article) stay
+                $this->store->setFields([$path], [
+                    'downRequest' => null,
+                    'note' => '',
+                    'decidedBy' => '',
+                    // the candidate, if there was one, was just discarded: no approved bytes are bound
+                    'candidateDigest' => '',
+                ]);
+            }
+
+            return $this->withCacheState([
+                'path' => $path,
+                'state' => $this->store->isLive($path) ? Article::STATE_EXTERNAL : Article::STATE_INTERNAL,
+                'intent' => $pending ? Article::INTENT_ONLINE : Article::INTENT_OFFLINE,
+                'cancelled' => true,
+                'owner' => $owner,
+            ]);
+        });
     }
 
     /**
      * The reviewer's decision about one entry.
      *
-     *   approve  apply the intent: `requested(online)` becomes `external`, `requested(offline)` and a
-     *            rejected request become `internal`
-     *   reject   the entry may not be on the site: `requested` (either direction) and an `external`
-     *            entry go to `internal`, with the note. On an external entry this is the reviewer's
-     *            direct take-down (下线), which is why it needs no request first.
+     *   approve  accept what the author asked for. A pending **online** request publishes the frozen
+     *            candidate (`pending/<target>` → `online/<target>`, and the host trees follow); the
+     *            manifest is not touched - the folders now say the page is live - except when the
+     *            candidate had no entry at all ({@see self::sourceExists()} and the X1 note below). The
+     *            source file has to still exist: a candidate whose file is gone is refused with a 409
+     *            (`SOURCE_GONE`) before the bridge is called, because publishing bytes nobody can
+     *            maintain is worse than a rejection. A pending **offline**
+     *            request takes the served version off the site: the bridge removes `online/<target>`
+     *            (and the host copies), and the entry is either forgotten (the author deleted the file)
+     *            or left with the request cleared.
+     *   reject   answer the request without doing what it asked: an online request's candidate is
+     *            discarded (the version the site already serves, if any, is untouched - a refused first
+     *            publication leaves the article internal, a refused update keeps the old page). An
+     *            offline request whose file is still there is simply cleared (the page stays on the
+     *            site, where it was); one whose file the author already **deleted** cannot stay: the
+     *            published copy is transferred to the site's orphan owner instead
+     *            ({@see OrphanTransfer}), and a failed handover is a conflict that leaves the request
+     *            waiting. The note is the reason the author reads.
      *
-     * The review grant is the only condition: a reviewer may decide about an entry they own too. On an
-     * instance whose only reviewer is also the author, refusing self-decisions would make every request
-     * undecidable; `decidedBy` records who decided, which is the accountability that matters.
+     * Nothing pending is not a decision this method takes: a reviewer's direct take-down is its own
+     * action ({@see self::takeDown()}), so a `decide` with nothing waiting is a conflict.
      *
-     * @throws NotFoundException when the manifest does not know the article
-     * @throws ConflictException when the decision does not apply to the entry's state
-     * @return array{path:string,state:string,decision:string,intent:string,owner:string,decidedBy:string}
+     * **A pending candidate and a take-off request at the same time are a conflict, not an order of
+     * precedence.** The pair is an inconsistent state nothing should produce (the delete path
+     * withdraws a candidate before it asks for the take-off, {@see
+     * ReviewStore::requestTakeDownForDeletedSources()}), but an older manifest or a discarded
+     * candidate that could not be withdrawn may still hold it. Silently letting `pending/` win would
+     * publish a version the author has just asked to take off the site - and, for a deleted source,
+     * bytes whose file no longer exists. The reviewer has to say which request they are answering:
+     * withdrawing the take-off request is the explicit way out.
+     *
+     * The whole method - the read of what waits, the bridge call and the manifest write - runs under
+     * one lock per article ({@see self::withReviewLock()}), so two reviewers cannot answer the same
+     * target at once.
+     *
+     * The bridge is called before anything is recorded, and a failure is re-thrown: the entry keeps
+     * waiting, the author or reviewer may retry, and nothing claims an operation the bridge did not
+     * carry out.
+     *
+     * @throws NotFoundException when neither the manifest nor the folders know the article
+     * @throws ConflictException when nothing is waiting for a decision, the two requests disagree, or another decision is in progress
+     * @throws BridgeException when the bridge cannot carry the decision out
+     * @return array{path:string,state:string,decision:string,intent:string,owner:string,decidedBy:string,wasOnSite:bool,sourceDeleted:bool,transferred?:bool,transfer?:array<string,mixed>,forgotten?:bool,cache_synced:bool,cache_message:string}
      */
     public function decide(string $reviewerUid, string $target, string $decision, string $note): array
     {
@@ -197,51 +340,379 @@ class ArticleReviewService
             throw new \InvalidArgumentException($this->l10n->t('A decision of “approve” or “reject” is required'));
         }
         $path = $this->path($target);
-        $manifest = $this->store->read();
-        $entry = $this->requireEntry($manifest, $path);
-        $owner = trim((string)$entry['owner']);
-        $state = (string)$entry['state'];
-        $intent = ReviewStore::intentOf($manifest, $path);
-        if ($decision === 'approve') {
-            if ($state !== Article::STATE_REQUESTED) {
-                throw new ConflictException($this->l10n->t('No request is waiting for a decision on this article.'));
-            }
-            $next = $intent === Article::INTENT_OFFLINE ? Article::STATE_INTERNAL : Article::STATE_EXTERNAL;
-            $this->store->setState([$path], $next, ['intent' => '', 'note' => '', 'decidedBy' => $reviewerUid]);
-        } else {
-            if ($state === Article::STATE_INTERNAL) {
-                throw new ConflictException($this->l10n->t('This article is not on the site and not requested either.'));
-            }
-            // `reject` is the decision that the entry may not be on the site: it applies to a pending
-            // request of either direction and to an entry that is already external (the direct 下线)
-            $this->store->setState([$path], Article::STATE_INTERNAL, [
-                'intent' => '',
-                'note' => $note,
-                'decidedBy' => $reviewerUid,
-            ]);
-            $next = Article::STATE_INTERNAL;
-        }
 
-        return [
-            'path' => $path,
-            'state' => $next,
-            'decision' => $decision,
-            'intent' => $intent,
-            'owner' => $owner,
-            'decidedBy' => $reviewerUid,
-        ];
+        return $this->withReviewLock($path, function () use ($reviewerUid, $path, $decision, $note): array {
+            // a decision reads `pending/` and `online/` to know what it is answering: a fallback
+            // answer may lag, and acting on it could publish or take down the wrong version
+            $this->store->requireTrustedTrees();
+            $manifest = $this->store->read();
+            $entry = ReviewStore::entryOf($manifest, $path);
+            $owner = $this->ownerOf($entry, $path);
+            $pending = $this->store->isPending($path);
+            $downRequest = ReviewStore::downRequestOf($manifest, $path);
+            $wasOnSite = $this->store->isLive($path);
+            if (!$pending && $downRequest === null && $entry === []) {
+                throw new NotFoundException($this->l10n->t('No such article: %s', [$path]));
+            }
+            if ($pending && $downRequest !== null) {
+                throw new ConflictException($this->l10n->t(
+                    'This article has both a waiting publication and a take-off request. Withdraw the take-off request first, then decide.',
+                ), ['pending' => true, 'downRequest' => true]);
+            }
+
+            if ($pending) {
+                if ($entry === []) {
+                    // X1: `candidate` writes `pending/` before the request writes the entry, so a
+                    // crash (or a timeout) between the two leaves a candidate the manifest does not
+                    // know. The owner is still derivable from the path, and writing it now gives every
+                    // later step - the decision record, a rejection, the next cancel - the entry it
+                    // writes to. It runs before the bridge call on purpose: a refused publish must
+                    // still leave that landing point behind.
+                    $this->store->setFields([$path], ['owner' => $owner]);
+                }
+                if ($decision === 'approve') {
+                    // the frozen bytes become the version the site serves; the bridge does both halves in
+                    // one operation (pending/ → online/ and the same bytes into the two host trees), so the
+                    // folders and the site cannot end up disagreeing about it. Nothing is written here:
+                    // `online/<target>` is the record. The digest the request recorded travels with the
+                    // approval, so the bridge can refuse bytes the author replaced in the meantime.
+                    if (!$this->sourceExists($path, $owner)) {
+                        // the candidate was frozen from a file that is gone: publishing it would put bytes
+                        // nobody can maintain (or edit afterwards) on the site. A rejection can still
+                        // discard it, which is why the request is not cleared here.
+                        throw new ConflictException(
+                            $this->l10n->t('The source file of this candidate no longer exists, so it can only be rejected.'),
+                            ['reason' => 'SOURCE_GONE'],
+                        );
+                    }
+                    $digest = trim((string)($entry['candidateDigest'] ?? ''));
+                    try {
+                        $this->bridge->reviewOp('publish', $owner, $path, $digest === '' ? null : $digest);
+                    } catch (BridgeException $e) {
+                        if ($e->getBridgeCode() !== 'DIGEST_MISMATCH') {
+                            throw $e;
+                        }
+                        // The candidate changed after the request: `pending/` holds bytes the reviewer
+                        // never saw. The candidate is deliberately left in place - the author may still
+                        // be waiting on it, and only a reviewer may decide what happens to it - while
+                        // the digest that no longer names those bytes is cleared, so a later retry
+                        // asks for the request to be filed again instead of publishing blind.
+                        if ($entry !== []) {
+                            $this->store->setFields([$path], ['candidateDigest' => '']);
+                        }
+                        throw new ConflictException(
+                            $this->l10n->t('The candidate changed after it was requested; ask the author to request the page again.'),
+                            [
+                                'reason' => 'DIGEST_MISMATCH',
+                                'expected' => (string)($e->getDetails()['expected'] ?? ''),
+                                'actual' => (string)($e->getDetails()['actual'] ?? ''),
+                            ],
+                        );
+                    }
+                    $this->store->refreshTrees();
+
+                    return $this->withCacheState([
+                        'path' => $path,
+                        'state' => Article::STATE_EXTERNAL,
+                        'decision' => $decision,
+                        'intent' => Article::INTENT_ONLINE,
+                        'owner' => $owner,
+                        'decidedBy' => $reviewerUid,
+                        'wasOnSite' => $wasOnSite,
+                    ]);
+                }
+
+                // a refused online request: the frozen copy is thrown away, and the version the site
+                // serves (if any) is deliberately not touched - refusing an update must not take the old
+                // page down, and refusing a first publication leaves the article internal
+                $this->bridge->reviewOp('discard', $owner, $path);
+                $this->store->refreshTrees();
+                // the reviewer's answer is recorded: which candidate it discarded (the digest goes with
+                // the candidate it described) and who said no, with the note the author reads. The
+                // entry is always there by now - X1 above wrote one for a candidate the manifest did
+                // not know - so the trail has a landing point.
+                $this->store->setFields([$path], [
+                    'candidateDigest' => '',
+                    'decidedBy' => $reviewerUid,
+                    'note' => $note,
+                ]);
+                $this->notifyRejected($owner, $path, $note, Notifier::DIRECTION_ONLINE);
+
+                return $this->withCacheState([
+                    'path' => $path,
+                    'state' => $this->store->isLive($path) ? Article::STATE_EXTERNAL : Article::STATE_INTERNAL,
+                    'decision' => $decision,
+                    'intent' => Article::INTENT_ONLINE,
+                    'owner' => $owner,
+                    'decidedBy' => $reviewerUid,
+                    'wasOnSite' => $wasOnSite,
+                ]);
+            }
+
+            if ($downRequest !== null) {
+                // whether the author's file is already gone, read from the filesystem and not from the
+                // request's `sourceDeleted` flag. The flag is what the delete path knew when it filed
+                // the request; the file may since have been restored from the trash (or deleted after
+                // an offline request), and it is the current fact that changes the answer to this
+                // request in both directions - a page nobody can edit any more cannot simply be kept
+                // online, while a page whose file is back must not be handed to the orphan owner.
+                $sourceDeleted = !$this->sourceExists($path, $owner);
+                if ($decision === 'approve') {
+                    // an approved take-offline removes the page from the site: the bridge deletes
+                    // `online/<target>` and the two host copies
+                    $this->bridge->reviewOp('take-down', $owner, $path);
+                    $this->store->refreshTrees();
+                    if ($sourceDeleted) {
+                        // the file is gone as well, so there is nothing left to request or decide about
+                        $this->store->forgetArticle([$path]);
+                    } else {
+                        $this->store->setFields([$path], [
+                            'downRequest' => null,
+                            'decidedBy' => $reviewerUid,
+                            'note' => '',
+                            // the page is off the site and no candidate waits for this entry
+                            'candidateDigest' => '',
+                        ]);
+                    }
+
+                    return $this->withCacheState([
+                        'path' => $path,
+                        'state' => Article::STATE_INTERNAL,
+                        'decision' => $decision,
+                        'intent' => Article::INTENT_OFFLINE,
+                        'owner' => $owner,
+                        'decidedBy' => $reviewerUid,
+                        'wasOnSite' => $wasOnSite,
+                        'sourceDeleted' => $sourceDeleted,
+                        'forgotten' => $sourceDeleted,
+                    ]);
+                }
+
+                if ($sourceDeleted) {
+                    // Refusing is not "keep the page up" any more: the author deleted the file, so nobody
+                    // can maintain it. The published copy is handed over to the site's orphan owner
+                    // instead - it becomes the site's own file, the old address leaves the site, and the
+                    // entry is forgotten by the handover.
+                    try {
+                        $transfer = $this->orphanTransfer->transfer($path);
+                    } catch (ConflictException $e) {
+                        throw $e;
+                    } catch (\Throwable $e) {
+                        throw new ConflictException($e->getMessage(), [
+                            'transfer_failed' => true,
+                            'reason' => $e instanceof BridgeException ? $e->getBridgeCode() : 'ERROR',
+                        ]);
+                    }
+                    $this->notifyRejected($owner, $path, $note, Notifier::DIRECTION_OFFLINE);
+
+                    return $this->withCacheState([
+                        'path' => $path,
+                        'state' => Article::STATE_INTERNAL,
+                        'decision' => $decision,
+                        'intent' => Article::INTENT_OFFLINE,
+                        'owner' => $owner,
+                        'decidedBy' => $reviewerUid,
+                        'wasOnSite' => $wasOnSite,
+                        'sourceDeleted' => true,
+                        'transferred' => true,
+                        'transfer' => $transfer,
+                    ]);
+                }
+
+                // a refused take-off of a page whose file is still there: the page never left the site, so
+                // only the request goes
+                $this->store->setFields([$path], ['downRequest' => null, 'decidedBy' => $reviewerUid, 'note' => $note]);
+                $this->notifyRejected($owner, $path, $note, Notifier::DIRECTION_OFFLINE);
+
+                return $this->withCacheState([
+                    'path' => $path,
+                    'state' => $this->store->isLive($path) ? Article::STATE_EXTERNAL : Article::STATE_INTERNAL,
+                    'decision' => $decision,
+                    'intent' => Article::INTENT_OFFLINE,
+                    'owner' => $owner,
+                    'decidedBy' => $reviewerUid,
+                    'wasOnSite' => $wasOnSite,
+                    'sourceDeleted' => false,
+                ]);
+            }
+
+            throw new ConflictException($this->l10n->t('No request is waiting for a decision on this article.'));
+        });
+    }
+
+    /**
+     * The reviewer's direct take-down: take a page the site serves off it, with nothing pending.
+     *
+     * It is its own action and not a `reject`, because it answers no request - a reviewer acts on their
+     * own judgement, and the author is told afterwards (the note is the reason). The bridge deletes
+     * `online/<target>` and the two host copies in one operation. The manifest entry is then either
+     * forgotten (the source file is gone too, so there is nothing left to request or decide about) or
+     * kept with its owner (the author still has the file, and the entry is where their next request
+     * lands); the next publish carries the removal out of the commit because the page is no longer in
+     * `online/`.
+     *
+     * Whether the file is gone is read from the filesystem at decision time, not from the request's
+     * `sourceDeleted` flag ({@see self::sourceExists()}): the flag records what the delete path knew,
+     * and the file may have been restored since.
+     *
+     * @throws NotFoundException when neither the folders nor the manifest know the article
+     * @throws ConflictException when the site does not have the article, or another decision about it is in progress
+     * @throws BridgeException when the bridge cannot carry the take-down out
+     * @return array{path:string,state:string,decision:string,intent:string,owner:string,decidedBy:string,wasOnSite:bool,sourceDeleted:bool,forgotten:bool,cache_synced:bool,cache_message:string}
+     */
+    public function takeDown(string $reviewerUid, string $target, string $note): array
+    {
+        $path = $this->path($target);
+
+        return $this->withReviewLock($path, function () use ($reviewerUid, $path, $note): array {
+            // whether the site serves the page comes from `online/`: the fallback cannot prove it does
+            // not, so a take-down waits until the bridge can confirm the state
+            $this->store->requireTrustedTrees();
+            $manifest = $this->store->read();
+            $entry = ReviewStore::entryOf($manifest, $path);
+            $owner = $this->ownerOf($entry, $path);
+            $downRequest = ReviewStore::downRequestOf($manifest, $path);
+            if (!$this->store->isLive($path)) {
+                if ($entry === [] && $downRequest === null) {
+                    throw new NotFoundException($this->l10n->t('No such article: %s', [$path]));
+                }
+                throw new ConflictException($this->l10n->t(
+                    'The site does not have this article, so there is nothing to take down.',
+                ));
+            }
+            $sourceDeleted = !$this->sourceExists($path, $owner);
+            $this->bridge->reviewOp('take-down', $owner, $path);
+            $this->store->refreshTrees();
+            // A take-offline request may still wait (a take-down answers the queue for this entry).
+            // The entry is forgotten only while the source file is gone as well: with the file still
+            // there the author can ask for the page again, and the entry (with its owner) is where
+            // that request lands - and where a candidate without an entry (X1) gets one.
+            if ($sourceDeleted) {
+                $this->store->forgetArticle([$path]);
+            } else {
+                $this->store->setFields([$path], [
+                    'owner' => $owner,
+                    'downRequest' => null,
+                    'decidedBy' => '',
+                    'note' => '',
+                    'candidateDigest' => '',
+                ]);
+            }
+            $this->notifyRejected($owner, $path, $note, Notifier::DIRECTION_TAKE_DOWN);
+
+            return $this->withCacheState([
+                'path' => $path,
+                'state' => Article::STATE_INTERNAL,
+                'decision' => 'take-down',
+                'intent' => '',
+                'owner' => $owner,
+                'decidedBy' => $reviewerUid,
+                'wasOnSite' => true,
+                'sourceDeleted' => $sourceDeleted,
+                'forgotten' => $sourceDeleted,
+            ]);
+        });
+    }
+
+    /**
+     * Run one review action under the exclusive lock of its target.
+     *
+     * The lock is what makes "read what is pending, call the bridge, write the manifest" one step for
+     * one article. Without it a take-down and an approval could both read the same state and both
+     * succeed: the one whose bridge call landed last won the folders, while the other still wrote its
+     * own answer - a page could be served again with no entry saying so, after both reviewers were
+     * told the page was off the site.
+     *
+     * It is the same provider the manifest write takes ({@see ReviewStore::mutate()}), under a key per
+     * article, so two articles never wait for each other while the same article is decided once. The
+     * lock is not recursive and nothing inside may take it again.
+     *
+     * @template T
+     * @param callable():T $action
+     * @return T
+     * @throws ConflictException when another decision about the article holds the lock
+     */
+    private function withReviewLock(string $path, callable $action): mixed
+    {
+        $key = self::REVIEW_LOCK_PREFIX . ltrim($path, '/');
+        try {
+            $this->locking->acquireLock($key, ILockingProvider::LOCK_EXCLUSIVE);
+        } catch (LockedException) {
+            throw new ConflictException(
+                $this->l10n->t('Another decision about this article is in progress. Please try again.'),
+                ['locked' => $key],
+            );
+        }
+        try {
+            return $action();
+        } finally {
+            $this->locking->releaseLock($key, ILockingProvider::LOCK_EXCLUSIVE);
+        }
+    }
+
+    /**
+     * The answer of a review action with the state of the cache behind it.
+     *
+     * The store writes the manifest first and syncs the article cache after it, and a sync that fails
+     * does not fail the action: the decision the folders hold is already in force, so answering 500
+     * would make the caller retry something that already happened.
+     *
+     * @param array<string,mixed> $answer
+     * @return array<string,mixed>
+     */
+    private function withCacheState(array $answer): array
+    {
+        $error = $this->store->lastCacheSyncFailed();
+
+        return [...$answer, 'cache_synced' => $error === null, 'cache_message' => $error ?? ''];
+    }
+
+    /**
+     * Tell the author their request was rejected. A notification must never fail a decision.
+     *
+     * @param string $direction one of {@see Notifier::DIRECTION_ONLINE}, {@see Notifier::DIRECTION_OFFLINE}
+     *                          or {@see Notifier::DIRECTION_TAKE_DOWN}
+     */
+    private function notifyRejected(string $owner, string $path, string $note, string $direction): void
+    {
+        if ($owner === '') {
+            // a skeleton post of the site itself has no author to tell
+            return;
+        }
+        try {
+            // The notification API caps the object id at 64 bytes; a site target is a full path and
+            // easily longer, so a digest stands in for the long ones.
+            $objectId = strlen($path) > 64 ? hash('sha256', $path) : $path;
+            $notification = $this->notifications->createNotification();
+            $notification
+                ->setApp(Application::APP_ID)
+                ->setUser($owner)
+                ->setDateTime(new \DateTime())
+                ->setObject('article', $objectId)
+                ->setSubject(Notifier::SUBJECT_REJECTED, [
+                    'name' => basename($path),
+                    'note' => $note,
+                    'direction' => $direction,
+                ])
+                ->setLink($this->url->linkToRouteAbsolute('pages.page.index'));
+            $this->notifications->notify($notification);
+        } catch (\Throwable $e) {
+            \OCP\Server::get(\Psr\Log\LoggerInterface::class)->warning(
+                'Pages: could not notify the author of the review decision.',
+                ['exception' => $e, 'path' => $path, 'direction' => $direction],
+            );
+        }
     }
 
     /**
      * How many **author** articles sit in each state, for the doctor and the admin panel.
      *
-     * The site's own files (`owner === ''`) are published with the site by an editor and never enter
-     * the visibility workflow: counting them made the request panel claim a pile of internal entries
-     * nobody can review — the demo posts a theme ships with `published: false` among them. A row whose
-     * author is gone or whose file no longer exists is left out too, so the numbers describe the site
-     * rather than the table. A table that cannot be read at all answers zeroes, which is a display
-     * problem and not one of the pages that ask for these numbers (the doctor reports the same table
-     * separately).
+     * The state is the derived one ({@see ReviewStore::stateIn()}): a down request means `requested`,
+     * otherwise the article is `external` exactly while `online/` holds it. The site's own files have
+     * no owner and never enter the visibility workflow; a row of an account that is gone is left out.
+     * A row whose file is gone is left out **unless a request is pending for it**: the scan still lists
+     * such an entry (the delete paths leave its take-off request behind), so counting it is what keeps
+     * the numbers in step with the panel.
      *
      * @return array<string,int>
      */
@@ -249,15 +720,18 @@ class ArticleReviewService
     {
         $counts = array_fill_keys(Article::STATES, 0);
         try {
+            $manifest = $this->store->read();
             foreach ($this->articles->findAll() as $row) {
                 if (trim((string)$row->getOwnerUid()) === '') {
                     continue;
                 }
-                // one lookup per row: the file has to be there for the article to be counted at all
-                if (!$this->liveRow($row) || !$this->rowFileExists($row)) {
+                if (!$this->liveRow($row)) {
                     continue;
                 }
-                $state = (string)$row->getState();
+                $state = $this->store->stateIn($manifest, (string)$row->getPath());
+                if ($state !== Article::STATE_REQUESTED && !$this->rowFileExists($row)) {
+                    continue;
+                }
                 $counts[$state] = ($counts[$state] ?? 0) + 1;
             }
         } catch (\Throwable) {
@@ -269,6 +743,11 @@ class ArticleReviewService
 
     /**
      * The requests nobody has looked at for a long time, for the doctor's warning.
+     *
+     * The moment a request was filed is the cache's `submitted_at` column: an offline request carries
+     * its own moment in the manifest, while a candidate's moment is the `pending/` file's mtime, which
+     * the store writes into the same column on the next sync. A row of the cache that drifted is
+     * repaired by the next review action, so this list is as current as the table it reads.
      *
      * @return list<string> target paths
      */
@@ -303,7 +782,7 @@ class ArticleReviewService
             return false;
         }
 
-        return $this->pathExists(trim((string)$row->getOwnerUid()), $path);
+        return $this->sourceExists($path, trim((string)$row->getOwnerUid()));
     }
 
     /** Whether an article still belongs to somebody: the site itself, or an account that exists. */
@@ -321,194 +800,50 @@ class ArticleReviewService
     }
 
     /**
-     * Which paths a publish call may commit.
-     *
-     * Two sources, deliberately:
-     *
-     *  - **everything `external`**, read from the visibility manifest: the diff the bridge prints is
-     *    capped at 100 entries, so the list of entries that were decided about cannot come from it;
-     *  - **everything else that changed**, but only for a caller who may edit, and never an author's
-     *    own files. That is what keeps a page that is not external out of a commit.
-     *
-     * The removals are the other half of the same list: a path the last commit put on the site is
-     * staged again when it is no longer external, which is how a take-down reaches the commit.
-     *
-     * @param list<string> $changed paths relative to the work copy, as the bridge reports them
-     * @return array{paths:list<string>,owners:array<string,string>,articles:list<array{path:string,owner:string}>,skipped:list<string>,stale:list<string>}
-     */
-    public function classify(array $changed, bool $canEdit): array
-    {
-        /** @var array<string,string> $paths site path => owner uid ('' for the site's own files) */
-        $paths = [];
-        $articles = [];
-        $skipped = [];
-        $stale = [];
-        $manifest = $this->store->read();
-
-        foreach ($manifest['entries'] as $target => $entry) {
-            // a pending take-offline request is still approved for the site (see ReviewStore::onSite())
-            if (!ReviewStore::onSite($manifest, (string)$target)) {
-                continue;
-            }
-            $owner = trim((string)$entry['owner']);
-            // An external entry can outlive its file: the account was deleted, or the author removed the
-            // post again. The mirror cannot delete what an app no longer lists, so such a file may
-            // still sit in the work copy - it must not be committed from here.
-            if (!$this->pathExists($owner, (string)$target)) {
-                continue;
-            }
-            $paths[$target] = $owner;
-            $articles[] = ['path' => $target, 'owner' => $owner];
-        }
-
-        // The published list is the truth about what the site has. A file that is on that list but no
-        // longer exists in Nextcloud was deleted (or its account was): the removal has to travel with
-        // the next commit, otherwise the site keeps serving a page nobody can edit any more.
-        //
-        // An entry that is no longer on the site (taken down, or its request rejected) is the same case
-        // with the file still on disk: its target left the list the mirror syncs, so the work copy has
-        // no copy of it and the commit has to carry the removal. The entry's *state* decides, not the
-        // file - the file stays, which is exactly why a "does the source exist" test would keep the path
-        // on the site forever. And the state does not change by itself, so a second publish stages the
-        // same removal as the first (there is nothing left to remove by then, and the published entry is
-        // forgotten once).
-        //
-        // `$mirrored` is what the last accepted push told the bridge the **commit tree** holds: a
-        // path that is still in that list has not been dropped from the commit tree yet, and staging
-        // it would commit a removal git does not have. A path that left it (taken down: still in the
-        // author area, no longer on the site) is exactly what the next commit has to carry away.
-        // Then the entry stays published until the push that omits it arrives.
-        $mirrored = $this->registry->getAuthorSourcesOnSite();
-        foreach ($manifest['published'] as $path => $entry) {
-            $owner = (string)$entry['owner'];
-            $offsite = $owner !== ''
-                && !ReviewStore::onSite($manifest, (string)$path)
-                && !in_array((string)$path, $mirrored[$owner] ?? [], true);
-            if (isset($paths[$path]) || (!$offsite && $this->pathExists($owner, (string)$path))) {
-                continue;
-            }
-            $paths[$path] = $owner;
-            $stale[] = $path;
-        }
-
-        foreach ($changed as $path) {
-            $rel = ltrim(trim((string)$path), '/');
-            if ($rel === '' || isset($paths[$rel])) {
-                continue;
-            }
-            if ($this->isAuthorPath($rel)) {
-                // an author's file is only published through a decision, never as a side effect
-                $skipped[$rel] = true;
-                continue;
-            }
-            if ($canEdit) {
-                $paths[$rel] = '';
-            }
-        }
-
-        $list = array_keys($paths);
-        sort($list);
-        $skippedList = array_keys($skipped);
-        sort($skippedList);
-        $staleList = array_values(array_unique($stale));
-        sort($staleList);
-
-        return [
-            'paths' => $list,
-            'owners' => $paths,
-            'articles' => $articles,
-            'skipped' => $skippedList,
-            'stale' => $staleList,
-        ];
-    }
-
-    /**
      * Whether a site path still has a file behind it: an author's path in their own folder, a path of
-     * the site itself in the site folder. A path whose account is gone answers `false` rather than
-     * throwing: it is simply not publishable.
+     * the site itself in the site folder.
+     *
+     * This is the **current** fact, read through the Files API and never from the article cache or
+     * from a `sourceDeleted` flag a request recorded: a file deleted after an offline request, or
+     * restored from the trash after one, has to change the decision, and only the filesystem knows
+     * that. A path whose account is gone answers `false` rather than throwing: it is simply not
+     * publishable.
+     *
+     * @param string $path the site target
+     * @param string $owner the article's owner, '' for a post of the site itself
      */
-    private function pathExists(string $uid, string $path): bool
+    private function sourceExists(string $path, string $owner): bool
     {
         $path = ltrim(trim($path), '/');
+        $owner = trim($owner);
         if ($path === '') {
             return false;
         }
         try {
-            if ($uid === '') {
+            if ($owner === '') {
                 $site = $this->registry->getSite();
-                $owner = trim((string)($site['nc_user'] ?? ''));
+                $storageUser = trim((string)($site['nc_user'] ?? ''));
                 $ncPath = trim((string)($site['nc_path'] ?? ''));
-                if ($owner === '' || $ncPath === '') {
+                if ($storageUser === '' || $ncPath === '') {
                     return false;
                 }
 
-                return $this->files->fileExists($owner, $ncPath, $path);
+                return $this->files->fileExists($storageUser, rtrim($ncPath, '/') . '/' . SiteTrees::SOURCE, $path);
             }
-            $resolved = $this->areas->resolve($uid, $path);
+            $resolved = $this->areas->resolve($owner, $path);
             if (!$resolved['ok']) {
-                // a path of the site itself, looked up for a uid that is not its owner
                 return false;
             }
 
-            return $this->files->fileExists($uid, $this->areas->area(), (string)$resolved['file']);
+            return $this->files->fileExists($owner, $this->areas->area(), (string)$resolved['file']);
         } catch (\Throwable) {
-            // an account that no longer exists, a path the area refuses, a backend that will not answer:
-            // all of them mean "there is no file to commit", which is what the callers ask
             return false;
         }
     }
 
     /**
-     * Record what the commit put on the site. Called with what the bridge actually accepted, so a
-     * failed publish leaves the entries external and the next attempt picks them up again.
-     *
-     * Three things happen, in this order: the published-file list learns the new paths (that is what
-     * the reading list and the take-down logic read), the removals that were carried out are forgotten,
-     * and the articles that went out keep their `external` state with the new moment and revision.
-     *
-     * @param array{paths:list<string>,owners:array<string,string>,articles:list<array{path:string,owner:string}>,stale:list<string>} $classified
-     * @return array{published:list<string>,forgotten:list<string>,recorded:int}
-     */
-    public function markPublished(array $classified, string $revision): array
-    {
-        $owners = is_array($classified['owners'] ?? null) ? $classified['owners'] : [];
-        // the removals go out of the list *after* the recording, so a path that was both staged as a
-        // removal and named by an entry cannot survive as a stale row
-        $recorded = $this->store->record($owners, $revision);
-        $forgotten = $this->store->forget(is_array($classified['stale'] ?? null) ? $classified['stale'] : []);
-
-        $done = [];
-        foreach ($classified['articles'] ?? [] as $article) {
-            $target = (string)($article['path'] ?? '');
-            if ($target !== '') {
-                $done[] = $target;
-            }
-        }
-        if ($done !== []) {
-            // the state does not move: `external` is the approval, the publish only records the moment
-            // and the revision that carries it
-            $this->store->setState($done, Article::STATE_EXTERNAL, [
-                'intent' => '',
-                'publishedAt' => time(),
-                'revision' => $revision,
-            ]);
-        }
-
-        return ['published' => $done, 'forgotten' => $forgotten, 'recorded' => $recorded];
-    }
-
-    /**
-     * How many files the *cache* says are on the site. {@see ReviewStore::published()} is the truth; the
-     * doctor prints both numbers, because two of them drifting apart is what a stale cache looks like.
-     */
-    public function publishedCount(): int
-    {
-        return $this->published->countAll();
-    }
-
-    /**
      * The article row behind a target, or an exception. Every entry point goes through here, so a
-     * target that the app does not know cannot be requested or decided about.
+     * target that the app does not know cannot be requested or withdrawn.
      */
     private function require(string $target): Article
     {
@@ -518,9 +853,6 @@ class ArticleReviewService
         }
         $article = $this->articles->findByPath($path);
         if ($article === null) {
-            // an entry that was never indexed (an image the author just uploaded, or a file the scan
-            // has not seen yet): the manifest is not the only place a decision can be prepared from,
-            // so the row is created from the file that is really there
             $this->registerMissing($path);
             $article = $this->articles->findByPath($path);
         }
@@ -533,8 +865,7 @@ class ArticleReviewService
 
     /**
      * Creates the cache row for an entry that has none yet. Only a file that really exists in an
-     * author's area is registered: a target naming nothing must stay unknown, and the caller gets the
-     * 404 it had before.
+     * author's area is registered: a target naming nothing must stay unknown.
      */
     private function registerMissing(string $path): void
     {
@@ -558,21 +889,19 @@ class ArticleReviewService
     }
 
     /**
-     * The manifest entry a decision is about, or a 404: a decision about an article the manifest does
-     * not know would be a decision about nothing.
+     * The owner of an entry: what the manifest recorded, or the uid of the author area the path names.
+     * The fallback matters because a candidate in `pending/` is not a manifest entry at all.
      *
-     * @param array<string,mixed> $manifest
-     * @return array<string,mixed>
-     * @throws NotFoundException
+     * @param array<string,mixed> $entry
      */
-    private function requireEntry(array $manifest, string $path): array
+    private function ownerOf(array $entry, string $path): string
     {
-        $entry = ReviewStore::entryOf($manifest, $path);
-        if ($entry === []) {
-            throw new NotFoundException($this->l10n->t('No such article: %s', [$path]));
+        $owner = trim((string)($entry['owner'] ?? ''));
+        if ($owner !== '') {
+            return $owner;
         }
 
-        return $entry;
+        return $this->areas->uidOfTarget(ltrim($path, '/')) ?? '';
     }
 
     /** Normalise whatever the client sent into the stored form (`/<author_root>/<uid>/<file>`). */
@@ -587,13 +916,5 @@ class ArticleReviewService
         }
 
         return '/' . ltrim($target, '/');
-    }
-
-    /** Whether a work-copy path belongs to an author area rather than to the site itself. */
-    private function isAuthorPath(string $rel): bool
-    {
-        // `<author_root>/<uid>/…` (and the retired `_posts/<uid>/…`): the uid segment is what makes
-        // it an author's, so the site's own `_posts/<file>.md` is not one
-        return $this->areas->uidOfTarget($rel) !== null;
     }
 }

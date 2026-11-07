@@ -159,7 +159,7 @@ final class FrontMatter
                 if (isset($seen[$key])) {
                     continue;
                 }
-                $out[] = $key . ': ' . self::toYaml($writing[$key]);
+                $out[] = $key . ': ' . self::toYaml($writing[$key], $key === 'categories');
                 $seen[$key] = true;
                 continue;
             }
@@ -168,7 +168,7 @@ final class FrontMatter
 
         foreach ($writing as $key => $value) {
             if (!isset($seen[$key])) {
-                $out[] = $key . ': ' . self::toYaml($value);
+                $out[] = $key . ': ' . self::toYaml($value, $key === 'categories');
             }
         }
 
@@ -294,7 +294,7 @@ final class FrontMatter
      * exactly the bytes it was given. The quoted form is what both Jekyll's YAML reader and
      * {@see self::scalar()} undo, so the value survives the trip unchanged.
      */
-    private static function toYaml(mixed $value): string
+    private static function toYaml(mixed $value, bool $quoteStrings = false): string
     {
         if (is_bool($value)) {
             return $value ? 'true' : 'false';
@@ -312,7 +312,10 @@ final class FrontMatter
                     // a nested map has no inline spelling this dialect can read back: skip it
                     continue;
                 }
-                $items[] = self::toYaml($item);
+                // `categories` is the one list written with every item quoted: a category names a
+                // folder in the site, and a quoted item keeps a slash out of the YAML syntax no
+                // matter what a reader makes of the bare form.
+                $items[] = $quoteStrings && is_string($item) ? self::quoted($item) : self::toYaml($item);
             }
             return '[' . implode(', ', $items) . ']';
         }

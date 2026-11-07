@@ -68,7 +68,7 @@ back to a read/write editor without build or publish.
   <screenshot>https://raw.githubusercontent.com/jiuyungame/nextcloud-pages/main/screenshots/4-settings.png</screenshot>
   <dependencies>
     <php min-version="8.1"/>
-    <nextcloud min-version="30" max-version="34"/>
+    <nextcloud min-version="30" max-version="35"/>
   </dependencies>
   <settings>
     <admin>OCA\Pages\Settings\Admin</admin>

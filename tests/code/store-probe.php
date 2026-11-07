@@ -2597,7 +2597,7 @@ namespace {
     $check('a day, a space-separated tag line, an inline list and a sentence keep their documented spelling',
         $fmLine($doc, 'date') === 'date: 2026-05-01'
         && $fmLine($doc, 'tags') === 'tags: one two'
-        && $fmLine($doc, 'categories') === 'categories: [guides, notes]'
+        && $fmLine($doc, 'categories') === 'categories: ["guides", "notes"]'
         && $fmLine($doc, 'excerpt') === 'excerpt: A fresh excerpt.');
 
     $before = $fm("layout: post\nmy_custom_key: keep me\npermalink: /probe/\ntitle: old");
@@ -2617,8 +2617,8 @@ namespace {
     $check('an apostrophe in a plain value still lets the comment be cut', ($fmRead("---\ntitle: Author's note # by bob\n---\n")['title'] ?? null) === "Author's note");
 
     $doc = FrontMatter::update($fm('title: old'), ['categories' => ['*x*', 'plain']]);
-    $check('a list item that needs quotes is quoted, the plain one stays bare',
-        $fmLine($doc, 'categories') === 'categories: ["*x*", plain]'
+    $check('every category is quoted, so a slash in one is never YAML syntax',
+        $fmLine($doc, 'categories') === 'categories: ["*x*", "plain"]'
         && ($fmRead($doc)['categories'] ?? null) === ['*x*', 'plain']);
 
     // The other direction of the same rule: a value that is only text is written as it is, whatever
@@ -2630,8 +2630,8 @@ namespace {
         && ($fmRead($doc)['title'] ?? null) === '中文标题', $fmLine($doc, 'title'));
 
     $doc = FrontMatter::update($fm('title: old'), ['categories' => ['中文']]);
-    $check('a Chinese list item is bare too, so an existing `categories: [中文]` is not rewritten',
-        $fmLine($doc, 'categories') === 'categories: [中文]'
+    $check('a Chinese category is quoted like every other one and still reads back',
+        $fmLine($doc, 'categories') === 'categories: ["中文"]'
         && ($fmRead($doc)['categories'] ?? null) === ['中文'], $fmLine($doc, 'categories'));
 
     // A date is the case where the quotes are not merely ugly: YAML 1.1 resolves a bare `2026-10-31`

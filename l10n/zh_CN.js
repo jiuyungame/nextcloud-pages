@@ -706,7 +706,7 @@ OC.L10N.register(
     "The built site, starting at index.html": "构建后的站点（从 index.html 开始）",
     "The candidate changed after it was requested; ask the author to request the page again.": "候选内容在申请后发生了变化；请作者重新申请该页面。",
     "The categories field must be a list of names": "分类字段必须是名称列表",
-    "The category “%s” is not allowed: use lower-case letters, digits, underscore or hyphen.": "分类“%s”不允许：请使用小写字母、数字、下划线或连字符。",
+    "The category “%s” is not allowed: use lower-case letters, digits, underscore or hyphen.": "分类“%s”不允许：请使用小写字母、数字、下划线、/或连字符。",
     "The comment could not be saved.": "评论未能保存。",
     "The comment is too long (%1$s of %2$s characters).": "评论过长（%1$s / %2$s 个字符）。",
     "The comments could not be loaded.": "评论加载失败。",

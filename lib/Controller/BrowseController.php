@@ -53,12 +53,9 @@ class BrowseController extends BaseController
 
     /**
      * A category name: lower-case letters, digits, underscore and hyphen - and every non-ASCII
-     * character, because a Chinese category is as valid a folder name as a Chinese slug is. No slash,
-     * whatever the flavour: a category is one folder at the site root, one path segment, which is
-     * exactly what PageUrlService::isCategoryName() requires - the panel must not accept a name the
-     * site can never use.
+     * character, because a Chinese category is as valid a folder name as a Chinese slug is. 
      */
-    private const CATEGORY_NAME = '/^[a-z0-9_\-\x{80}-\x{10FFFF}]+$/u';
+    private const CATEGORY_NAME = '/^[a-z0-9_\-\/\x{80}-\x{10FFFF}]+$/u';
 
     /**
      * Fields of the answer that are read-only for the client: `modified_date` is the server's own stamp,
@@ -1122,7 +1119,7 @@ class BrowseController extends BaseController
             }
             if (preg_match(self::CATEGORY_NAME, $name) !== 1) {
                 throw new \InvalidArgumentException($this->l10n->t(
-                    'The category “%s” is not allowed: use lower-case letters, digits, underscore or hyphen.',
+                    'The category “%s” is not allowed: use lower-case letters, digits, underscore, / or hyphen.',
                     [$name],
                 ));
             }
